@@ -50,6 +50,7 @@ def _is_tool_available(cmd):
 
 # ─── Engine runner ────────────────────────────────────────────────────────────
 
+
 def _run_engine(engine_name, version_cmd, engine_func, *args):
     """
     Run a single scanner engine and capture:
@@ -161,25 +162,107 @@ def extract_zip(zip_path, target_dir):
         return False
 
 
+# ─── Language detection ───────────────────────────────────────────────────────
+
+# Maps file extension → friendly language name
+_EXT_LANGUAGE = {
+    '.py':   'Python',
+    '.js':   'JavaScript',
+    '.ts':   'TypeScript',
+    '.jsx':  'JavaScript',
+    '.tsx':  'TypeScript',
+    '.java': 'Java',
+    '.php':  'PHP',
+    '.rb':   'Ruby',
+    '.go':   'Go',
+    '.cs':   'C#',
+    '.cpp':  'C++',
+    '.c':    'C',
+    '.rs':   'Rust',
+    '.kt':   'Kotlin',
+    '.swift':'Swift',
+    '.sh':   'Shell',
+    '.bash': 'Shell',
+    '.html': 'HTML',
+    '.htm':  'HTML',
+    '.xml':  'XML',
+    '.yaml': 'YAML',
+    '.yml':  'YAML',
+    '.json': 'JSON',
+    '.sql':  'SQL',
+    '.env':  'Env',
+}
+
+_SKIP_DIRS = {'__pycache__', '.git', 'node_modules', '.venv', 'venv', 'dist', 'build'}
+
+
+def _detect_languages(source_dir):
+    """
+    Walk source_dir and return a dict of {language: file_count} for every
+    recognised source-code extension found.
+    """
+    counts = {}
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        for fname in files:
+            ext = Path(fname).suffix.lower()
+            lang = _EXT_LANGUAGE.get(ext)
+            if lang:
+                counts[lang] = counts.get(lang, 0) + 1
+    return counts
+
+
+def _has_python(source_dir):
+    for root, dirs, files in os.walk(source_dir):
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+        if any(f.endswith('.py') for f in files):
+            return True
+    return False
+
+
 # ─── Core scan logic ──────────────────────────────────────────────────────────
 
 def _run_scan(scan_id, scan_name, version, source_dir, reports_dir):
     update_scan_status(scan_id, 'running')
     total_files = _count_files(source_dir)
 
-    # Define all engines: (display_name, version_cmd_or_None, function)
-    engines = [
-        ('Bandit',        'bandit',  run_bandit,          source_dir),
-        ('Semgrep',       'semgrep', run_semgrep,         source_dir),
-        ('SecretsScanner', None,     run_secrets_scanner, source_dir),
-        ('PatternScanner', None,     run_pattern_scanner, source_dir),
-    ]
+    # Detect languages present in the uploaded project
+    detected_langs = _detect_languages(source_dir)
+    has_python     = 'Python' in detected_langs
+
+    # Build language summary string for display
+    lang_str = ', '.join(
+        f"{l} ({c} file{'s' if c != 1 else ''})"
+        for l, c in sorted(detected_langs.items(), key=lambda x: -x[1])
+    ) or 'unknown'
 
     raw_findings   = []
     engine_results = []
 
-    for engine_name, version_cmd, func, *fargs in engines:
-        findings, result = _run_engine(engine_name, version_cmd, func, *fargs)
+    # Bandit is Python-only — skip it when the project has no Python files
+    if has_python:
+        findings, result = _run_engine('Bandit', 'bandit', run_bandit, source_dir)
+        result['engine_version'] = f"{result['engine_version']} | {lang_str}"
+        raw_findings.extend(findings)
+        engine_results.append(result)
+    else:
+        engine_results.append({
+            'engine_name':      'Bandit',
+            'status':           'skipped',
+            'findings_count':   0,
+            'duration_seconds': 0,
+            'engine_version':   lang_str,
+            'error_message':    'No Python files detected — Bandit is Python-only.',
+            'ran_at':           datetime.utcnow().isoformat(),
+        })
+
+    # Remaining engines run on all projects
+    for engine_name, version_cmd, func, farg in [
+        ('Semgrep',        'semgrep', run_semgrep,         source_dir),
+        ('SecretsScanner', None,      run_secrets_scanner, source_dir),
+        ('PatternScanner', None,      run_pattern_scanner, source_dir),
+    ]:
+        findings, result = _run_engine(engine_name, version_cmd, func, farg)
         raw_findings.extend(findings)
         engine_results.append(result)
 
