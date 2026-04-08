@@ -1,0 +1,15 @@
+Flask==3.0.0
+Werkzeug==3.0.1
+Flask-Login==0.6.3
+Jinja2==3.1.2
+
+# SAST engines — install the latest compatible versions
+bandit>=1.7.7
+semgrep>=1.50.0
+
+# Reporting
+reportlab>=4.0.0
+
+# DB / security utilities
+SQLAlchemy>=2.0.0
+python-dotenv>=1.0.0

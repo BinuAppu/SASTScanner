@@ -1,0 +1,476 @@
+{% extends 'base.html' %}
+{% block title %}{{ scan.name }} v{{ scan.version }} – SAST Scanner{% endblock %}
+{% block page_title %}
+  <span style="color:var(--text-muted)">Scan /</span> {{ scan.name }}
+  <span class="version-badge" style="margin-left:.5rem">v{{ scan.version }}</span>
+{% endblock %}
+
+{% block topbar_actions %}
+  {% if scan.status == 'completed' %}
+  <div class="btn-group">
+    <a href="{{ url_for('download_report', scan_id=scan.id, fmt='html') }}" target="_blank"
+       class="btn btn-ghost btn-sm">HTML</a>
+    <a href="{{ url_for('download_report', scan_id=scan.id, fmt='csv') }}"
+       class="btn btn-ghost btn-sm">CSV</a>
+    <a href="{{ url_for('download_report', scan_id=scan.id, fmt='pdf') }}"
+       class="btn btn-primary btn-sm">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+      </svg>
+      PDF Report
+    </a>
+  </div>
+  {% endif %}
+  <a href="{{ url_for('new_scan') }}" class="btn btn-outline btn-sm">Upload New Version</a>
+  <button class="btn btn-danger btn-sm"
+          onclick="document.getElementById('del-version-modal').classList.add('open')">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+    </svg>
+    Delete This Version
+  </button>
+{% endblock %}
+
+{% block extra_head %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+{% endblock %}
+
+{% block content %}
+
+<!-- Version History -->
+{% if versions | length > 1 %}
+<div class="version-strip">
+  <span class="version-label">Versions:</span>
+  {% for v in versions %}
+  <a href="{{ url_for('scan_detail', scan_id=v.id) }}"
+     class="version-link {% if v.id == scan.id %}active{% endif %}">
+    v{{ v.version }}
+    <span class="status-dot status-dot-{{ v.status }}"></span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<!-- Status Banner (running / failed) -->
+{% if scan.status == 'running' %}
+<div class="banner banner-running" id="running-banner">
+  <div class="banner-left">
+    <span class="pulse-dot large"></span>
+    <strong>Scan in progress</strong> — Running all security engines…
+  </div>
+  <div class="banner-right">
+    <div class="progress-bar-wrap">
+      <div class="progress-bar indeterminate"></div>
+    </div>
+  </div>
+</div>
+{% elif scan.status == 'failed' %}
+<div class="banner banner-error">
+  <strong>Scan failed</strong>
+  {% if scan.error_message %}: {{ scan.error_message }}{% endif %}
+</div>
+{% endif %}
+
+<!-- Summary Cards -->
+{% if scan.status == 'completed' %}
+<div class="stats-grid stats-grid-6">
+  <div class="stat-card stat-total">
+    <div class="stat-icon">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+      </svg>
+    </div>
+    <div class="stat-info">
+      <div class="stat-value">{{ scan.total_files or 0 }}</div>
+      <div class="stat-label">Files Scanned</div>
+    </div>
+  </div>
+  <div class="stat-card" style="--card-accent:#ff4757">
+    <div class="stat-info">
+      <div class="stat-value" style="color:#ff4757">{{ scan.critical_count or 0 }}</div>
+      <div class="stat-label">Critical</div>
+    </div>
+  </div>
+  <div class="stat-card" style="--card-accent:#ff6b35">
+    <div class="stat-info">
+      <div class="stat-value" style="color:#ff6b35">{{ scan.high_count or 0 }}</div>
+      <div class="stat-label">High</div>
+    </div>
+  </div>
+  <div class="stat-card" style="--card-accent:#ffa502">
+    <div class="stat-info">
+      <div class="stat-value" style="color:#ffa502">{{ scan.medium_count or 0 }}</div>
+      <div class="stat-label">Medium</div>
+    </div>
+  </div>
+  <div class="stat-card" style="--card-accent:#2ed573">
+    <div class="stat-info">
+      <div class="stat-value" style="color:#2ed573">{{ scan.low_count or 0 }}</div>
+      <div class="stat-label">Low</div>
+    </div>
+  </div>
+  <div class="stat-card" style="--card-accent:#1e90ff">
+    <div class="stat-info">
+      <div class="stat-value" style="color:#1e90ff">{{ scan.info_count or 0 }}</div>
+      <div class="stat-label">Info</div>
+    </div>
+  </div>
+</div>
+
+<!-- Charts + Version stats -->
+<div class="charts-row">
+  <div class="card chart-card">
+    <div class="card-header"><h3 class="card-title">Severity Distribution</h3></div>
+    <div class="chart-container"><canvas id="sevChart"></canvas></div>
+  </div>
+  <div class="card chart-card">
+    <div class="card-header"><h3 class="card-title">Finding Status</h3></div>
+    <div class="chart-container"><canvas id="statusChart"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-header"><h3 class="card-title">Version Comparison</h3></div>
+    <div class="version-compare">
+      {% set new_count = findings | selectattr('status', 'equalto', 'new') | list | length %}
+      {% set rec_count = findings | selectattr('status', 'equalto', 'recurring') | list | length %}
+      {% set fix_count = findings | selectattr('status', 'equalto', 'fixed') | list | length %}
+      <div class="vc-item vc-new">
+        <div class="vc-count">{{ new_count }}</div>
+        <div class="vc-label">New</div>
+        <div class="vc-desc">Findings introduced in this version</div>
+      </div>
+      <div class="vc-item vc-recurring">
+        <div class="vc-count">{{ rec_count }}</div>
+        <div class="vc-label">Recurring</div>
+        <div class="vc-desc">Present in previous version too</div>
+      </div>
+      <div class="vc-item vc-fixed">
+        <div class="vc-count">{{ fix_count }}</div>
+        <div class="vc-label">Fixed</div>
+        <div class="vc-desc">Resolved since last version</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Engine Status Panel -->
+{% if engine_results %}
+<div class="card engine-card">
+  <div class="card-header">
+    <h2 class="card-title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+      Scan Engine Status
+      <span class="badge-count">{{ engine_results | length }} engines</span>
+    </h2>
+    <div style="font-size:12px;color:var(--text-muted)">
+      All engines ran during this scan — results merged and deduplicated
+    </div>
+  </div>
+  <div class="engine-grid">
+    {% for e in engine_results %}
+    <div class="engine-tile engine-{{ e.status }}">
+      <div class="engine-tile-top">
+        <div class="engine-status-icon">
+          {% if e.status == 'completed' %}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+            <polyline points="22 4 12 14.01 9 11.01"/>
+          </svg>
+          {% elif e.status == 'failed' %}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>
+          </svg>
+          {% elif e.status == 'skipped' %}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="9" x2="14" y2="15"/>
+          </svg>
+          {% else %}
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+          </svg>
+          {% endif %}
+        </div>
+        <div class="engine-name">{{ e.engine_name }}</div>
+        <span class="engine-badge engine-badge-{{ e.status }}">{{ e.status | title }}</span>
+      </div>
+      <div class="engine-tile-stats">
+        <div class="engine-stat">
+          <div class="engine-stat-val {% if e.findings_count > 0 %}has-findings{% endif %}">
+            {{ e.findings_count }}
+          </div>
+          <div class="engine-stat-lbl">Findings</div>
+        </div>
+        <div class="engine-stat">
+          <div class="engine-stat-val">{{ '%.1f'|format(e.duration_seconds) }}s</div>
+          <div class="engine-stat-lbl">Duration</div>
+        </div>
+      </div>
+      {% if e.engine_version %}
+      <div class="engine-version" title="{{ e.engine_version }}">{{ e.engine_version[:45] }}{% if e.engine_version|length > 45 %}…{% endif %}</div>
+      {% endif %}
+      {% if e.error_message %}
+      <div class="engine-error">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+          <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        {{ e.error_message[:120] }}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% set all_ok = engine_results | selectattr('status', 'equalto', 'failed') | list | length == 0 %}
+  <div class="engine-summary {% if all_ok %}engine-summary-ok{% else %}engine-summary-warn{% endif %}">
+    {% if all_ok %}
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
+    </svg>
+    All {{ engine_results | length }} engines completed successfully — findings merged and deduplicated before reporting.
+    {% else %}
+    {% set failed = engine_results | selectattr('status', 'equalto', 'failed') | list %}
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+      <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+    </svg>
+    {{ failed | length }} engine(s) encountered errors:
+    {% for f in failed %}<strong>{{ f.engine_name }}</strong>{% if not loop.last %}, {% endif %}{% endfor %}.
+    Results shown are from engines that completed.
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<!-- Findings Table -->
+<div class="card">
+  <div class="card-header">
+    <h2 class="card-title">Findings
+      <span class="badge-count">{{ findings | length }}</span>
+    </h2>
+    <div class="card-actions filters-row">
+      <select id="sev-filter" onchange="applyFilters()" class="filter-select">
+        <option value="">All Severities</option>
+        <option value="CRITICAL">Critical</option>
+        <option value="HIGH">High</option>
+        <option value="MEDIUM">Medium</option>
+        <option value="LOW">Low</option>
+        <option value="INFO">Info</option>
+      </select>
+      <select id="status-filter" onchange="applyFilters()" class="filter-select">
+        <option value="">All Statuses</option>
+        <option value="new">New</option>
+        <option value="recurring">Recurring</option>
+        <option value="fixed">Fixed</option>
+      </select>
+      <select id="tool-filter" onchange="applyFilters()" class="filter-select">
+        <option value="">All Tools</option>
+        {% for tool in findings | map(attribute='tool') | unique | sort %}
+        <option value="{{ tool }}">{{ tool }}</option>
+        {% endfor %}
+      </select>
+      <input type="text" id="finding-search" placeholder="Search…" class="search-input"
+             oninput="applyFilters()">
+    </div>
+  </div>
+
+  {% if findings %}
+  <div class="table-wrapper">
+    <table class="data-table findings-table" id="findings-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Severity</th>
+          <th>Status</th>
+          <th>File</th>
+          <th>Line</th>
+          <th>Vulnerability</th>
+          <th>CWE</th>
+          <th>CVE</th>
+          <th>Tool</th>
+          <th>Recommendation</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in findings %}
+        <tr data-sev="{{ f.severity }}"
+            data-status="{{ f.status }}"
+            data-tool="{{ f.tool }}"
+            data-search="{{ (f.vulnerability ~ ' ' ~ f.file_path ~ ' ' ~ f.description) | lower }}">
+          <td class="idx-cell">{{ loop.index }}</td>
+          <td>
+            <span class="sev-badge {{ f.severity | severity_class }}">{{ f.severity }}</span>
+          </td>
+          <td>
+            <span class="status-badge {{ f.status | status_class }}">{{ f.status | upper }}</span>
+          </td>
+          <td class="file-cell" title="{{ f.file_path }}">
+            <span class="monospace">{{ f.file_path }}</span>
+          </td>
+          <td class="line-cell">{{ f.line_number or '—' }}</td>
+          <td class="vuln-cell">
+            <div class="vuln-name">{{ f.vulnerability }}</div>
+            {% if f.description %}
+            <div class="vuln-desc">{{ f.description }}</div>
+            {% endif %}
+            {% if f.code_snippet %}
+            <div class="code-toggle" onclick="this.nextElementSibling.classList.toggle('show')">
+              Show code ▾
+            </div>
+            <pre class="code-snippet collapsible">{{ f.code_snippet }}</pre>
+            {% endif %}
+          </td>
+          <td>
+            {% if f.cwe_id %}
+            <a href="https://cwe.mitre.org/data/definitions/{{ f.cwe_id | replace('CWE-', '') }}.html"
+               target="_blank" rel="noopener" class="cwe-link">{{ f.cwe_id }}</a>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            {% if f.cve_id %}
+            <a href="https://nvd.nist.gov/vuln/detail/{{ f.cve_id }}"
+               target="_blank" rel="noopener" class="cve-link">{{ f.cve_id }}</a>
+            {% else %}—{% endif %}
+          </td>
+          <td><span class="tool-badge">{{ f.tool }}</span></td>
+          <td class="rec-cell">{{ f.recommendation }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="table-footer">
+    <span id="visible-count">{{ findings | length }}</span> of {{ findings | length }} findings shown
+  </div>
+  {% else %}
+  <div class="empty-state">
+    <div class="empty-icon">
+      <svg width="50" height="50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1">
+        <path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+      </svg>
+    </div>
+    <h3>No vulnerabilities found</h3>
+    <p>This scan produced no findings. The code looks clean!</p>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+// ── Charts ────────────────────────────────────────────────────────────────────
+const sevData = {
+  labels: ['Critical','High','Medium','Low','Info'],
+  datasets: [{
+    data: [{{ scan.critical_count }},{{ scan.high_count }},{{ scan.medium_count }},{{ scan.low_count }},{{ scan.info_count }}],
+    backgroundColor: ['#ff4757','#ff6b35','#ffa502','#2ed573','#1e90ff'],
+    borderWidth: 2, borderColor: '#1a1d27'
+  }]
+};
+const chartOpts = {
+  plugins: { legend: { labels: { color: '#e0e0e0', font: { size: 12 } } } },
+  cutout: '65%'
+};
+new Chart(document.getElementById('sevChart'), { type:'doughnut', data: sevData, options: chartOpts });
+
+{% set new_c = findings | selectattr('status','equalto','new') | list | length %}
+{% set rec_c = findings | selectattr('status','equalto','recurring') | list | length %}
+{% set fix_c = findings | selectattr('status','equalto','fixed') | list | length %}
+new Chart(document.getElementById('statusChart'), {
+  type: 'doughnut',
+  data: {
+    labels: ['New','Recurring','Fixed'],
+    datasets: [{ data: [{{ new_c }},{{ rec_c }},{{ fix_c }}],
+      backgroundColor: ['#ff4757','#ffa502','#2ed573'],
+      borderWidth: 2, borderColor: '#1a1d27' }]
+  },
+  options: chartOpts
+});
+
+// ── Filters ───────────────────────────────────────────────────────────────────
+function applyFilters() {
+  const sev    = document.getElementById('sev-filter').value;
+  const status = document.getElementById('status-filter').value;
+  const tool   = document.getElementById('tool-filter').value;
+  const q      = document.getElementById('finding-search').value.toLowerCase();
+  let visible  = 0;
+
+  document.querySelectorAll('#findings-table tbody tr').forEach((row, i) => {
+    const match = (!sev    || row.dataset.sev    === sev)
+               && (!status || row.dataset.status === status)
+               && (!tool   || row.dataset.tool   === tool)
+               && (!q      || row.dataset.search.includes(q));
+    row.style.display = match ? '' : 'none';
+    if (match) {
+      visible++;
+      row.querySelector('.idx-cell').textContent = visible;
+    }
+  });
+  document.getElementById('visible-count').textContent = visible;
+}
+</script>
+
+{% elif scan.status == 'running' %}
+<div class="empty-state">
+  <div class="spinner large-spinner"></div>
+  <h3>Scan is running</h3>
+  <p>Security engines are analyzing your code. This page will refresh automatically.</p>
+</div>
+<script>
+setTimeout(() => {
+  function checkStatus() {
+    fetch('/api/scan/{{ scan.id }}/status')
+      .then(r => r.json())
+      .then(d => {
+        if (d.status !== 'running') location.reload();
+        else setTimeout(checkStatus, 3000);
+      }).catch(() => setTimeout(checkStatus, 5000));
+  }
+  checkStatus();
+}, 3000);
+</script>
+{% endif %}
+
+<!-- Delete Version Modal -->
+<div class="modal-overlay" id="del-version-modal"
+     onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal-box">
+    <div class="modal-icon modal-icon-danger">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <polyline points="3 6 5 6 21 6"/>
+        <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+        <path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/>
+      </svg>
+    </div>
+    <h3 class="modal-title">Delete Version v{{ scan.version }}</h3>
+    <p class="modal-body">
+      This will permanently delete version <strong>v{{ scan.version }}</strong> of
+      <strong>{{ scan.name }}</strong>, including all findings and reports stored for this version.
+      {% set versions_count = versions | length %}
+      {% if versions_count <= 1 %}
+      <br><br>This is the <strong>only version</strong> — deleting it will remove the entire scan.
+      {% endif %}
+      <br><br>This action <strong>cannot be undone</strong>.
+    </p>
+    <form method="POST" action="{{ url_for('delete_scan_version_route', scan_id=scan.id) }}">
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost"
+                onclick="document.getElementById('del-version-modal').classList.remove('open')">
+          Cancel
+        </button>
+        <button type="submit" class="btn btn-danger">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="3 6 5 6 21 6"/>
+            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          </svg>
+          Yes, Delete v{{ scan.version }}
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

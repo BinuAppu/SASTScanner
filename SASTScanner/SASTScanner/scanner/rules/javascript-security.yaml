@@ -1,0 +1,262 @@
+rules:
+
+  # ─── Code Injection ───────────────────────────────────────────────────────────
+
+  - id: js-eval
+    pattern: eval(...)
+    message: >
+      eval() executes arbitrary JavaScript. Never use with untrusted input.
+      Refactor to remove the need for dynamic code execution.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-78"]
+      confidence: HIGH
+      category: security
+
+  - id: js-function-constructor
+    pattern: new Function(...)
+    message: >
+      The Function constructor executes a string as JavaScript code and is
+      equivalent to eval(). Avoid using it with user-supplied data.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-78"]
+      confidence: HIGH
+      category: security
+
+  - id: js-settimeout-string
+    pattern: setTimeout("...", ...)
+    message: >
+      Passing a string to setTimeout() is equivalent to eval(). Pass a function
+      reference instead: setTimeout(() => { ... }, delay).
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-78"]
+      confidence: HIGH
+      category: security
+
+  - id: js-setinterval-string
+    pattern: setInterval("...", ...)
+    message: >
+      Passing a string to setInterval() is equivalent to eval(). Pass a function
+      reference instead.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-78"]
+      confidence: HIGH
+      category: security
+
+  # ─── XSS ─────────────────────────────────────────────────────────────────────
+
+  - id: js-innerhtml-assignment
+    pattern: $EL.innerHTML = $VAL
+    message: >
+      Assigning to innerHTML can lead to XSS if $VAL contains user input.
+      Use textContent for plain text, or sanitise with DOMPurify before setting innerHTML.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-79"]
+      confidence: MEDIUM
+      category: security
+
+  - id: js-outerhtml-assignment
+    pattern: $EL.outerHTML = $VAL
+    message: >
+      Assigning to outerHTML can lead to XSS. Sanitise content before inserting it
+      into the DOM.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-79"]
+      confidence: MEDIUM
+      category: security
+
+  - id: js-insertadjacenthtml
+    pattern: $EL.insertAdjacentHTML(...)
+    message: >
+      insertAdjacentHTML() can cause XSS if unsanitised user data is inserted.
+      Use insertAdjacentText() or sanitise the content first.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-79"]
+      confidence: MEDIUM
+      category: security
+
+  - id: js-document-write
+    pattern: document.write(...)
+    message: >
+      document.write() can lead to XSS and blocks the HTML parser.
+      Use DOM APIs (createElement, appendChild) instead.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-79"]
+      confidence: MEDIUM
+      category: security
+
+  - id: js-document-writeln
+    pattern: document.writeln(...)
+    message: >
+      document.writeln() can lead to XSS. Use DOM APIs instead.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-79"]
+      confidence: MEDIUM
+      category: security
+
+  # ─── Prototype Pollution ──────────────────────────────────────────────────────
+
+  - id: js-prototype-pollution
+    pattern: $OBJ.__proto__ = $VAL
+    message: >
+      Assigning to __proto__ can pollute the Object prototype and lead to
+      privilege escalation or unexpected behaviour. Use Object.create(null) or
+      Object.assign() with a safe target.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-1321"]
+      confidence: HIGH
+      category: security
+
+  # ─── Hardcoded Secrets ────────────────────────────────────────────────────────
+
+  - id: js-hardcoded-secret-key
+    patterns:
+      - pattern: const $VAR = "..."
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i)(secret|api_?key|auth_?token|access_?token|private_?key|password|passwd)
+    message: >
+      Hardcoded secret in JavaScript source. Use environment variables
+      (process.env.SECRET) and never commit credentials.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-798"]
+      confidence: LOW
+      category: security
+
+  # ─── Insecure Randomness ──────────────────────────────────────────────────────
+
+  - id: js-math-random
+    pattern: Math.random()
+    message: >
+      Math.random() is not cryptographically secure. Use crypto.getRandomValues()
+      (browser) or crypto.randomBytes() (Node.js) for security-sensitive values.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-330"]
+      confidence: LOW
+      category: security
+
+  # ─── SQL Injection (Node.js) ──────────────────────────────────────────────────
+
+  - id: js-sql-injection-concat
+    pattern: $CONN.query($Q + ...)
+    message: >
+      SQL query built via string concatenation is vulnerable to SQL injection.
+      Use parameterised queries or prepared statements.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-89"]
+      confidence: MEDIUM
+      category: security
+
+  - id: js-sql-injection-template
+    pattern: $CONN.query(`...`)
+    message: >
+      SQL query built with a template literal may be vulnerable to SQL injection
+      if it interpolates user input. Use parameterised queries.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-89"]
+      confidence: LOW
+      category: security
+
+  # ─── Path Traversal (Node.js) ─────────────────────────────────────────────────
+
+  - id: js-path-traversal-readfile
+    pattern: fs.readFile(req.$ATTR, ...)
+    message: >
+      Reading a file using a request attribute is vulnerable to path traversal.
+      Sanitise and validate the path before using it.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-22"]
+      confidence: HIGH
+      category: security
+
+  - id: js-path-traversal-readfilesync
+    pattern: fs.readFileSync(req.$ATTR, ...)
+    message: >
+      Reading a file synchronously with a request attribute is vulnerable to path
+      traversal. Sanitise and resolve the path before use.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-22"]
+      confidence: HIGH
+      category: security
+
+  # ─── Sensitive Data in localStorage ──────────────────────────────────────────
+
+  - id: js-localstorage-sensitive
+    patterns:
+      - pattern: localStorage.setItem($KEY, ...)
+      - metavariable-regex:
+          metavariable: $KEY
+          regex: (?i)(token|password|secret|auth|session|key|credential)
+    message: >
+      Storing sensitive data in localStorage exposes it to XSS attacks.
+      Use secure, HttpOnly cookies for authentication tokens.
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-922"]
+      confidence: MEDIUM
+      category: security
+
+  # ─── Unsafe Redirects ─────────────────────────────────────────────────────────
+
+  - id: js-open-redirect
+    pattern: window.location = req.$ATTR
+    message: >
+      Redirecting to a user-controlled URL enables open redirect attacks.
+      Validate the redirect target against an allowlist.
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-601"]
+      confidence: HIGH
+      category: security
+
+  # ─── Helmet / Security Headers (Express) ─────────────────────────────────────
+
+  - id: js-express-no-helmet
+    patterns:
+      - pattern: const $APP = express()
+      - pattern-not-inside: |
+          ...
+          $APP.use(helmet(...))
+          ...
+    message: >
+      Express app without Helmet. Use the helmet middleware to set security headers
+      (Content-Security-Policy, X-Frame-Options, etc.).
+    languages: [javascript, typescript]
+    severity: INFO
+    metadata:
+      cwe: ["CWE-693"]
+      confidence: LOW
+      category: security
