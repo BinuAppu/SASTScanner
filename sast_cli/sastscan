@@ -1,0 +1,1602 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  sastscan - Open-Source Static Application Security Testing Scanner
+#  Version : 1.0.0
+#  License : MIT
+#  GitHub  : https://github.com/your-org/sastscan
+# =============================================================================
+#  Usage   : sastscan --zip <file.zip> --name <ScanName> [options]
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOLS_DIR="/opt/tools/SASTScanner"
+
+# ── Locate lib dir ────────────────────────────────────────────────────────────
+if   [[ -f "${SCRIPT_DIR}/lib/generate_report.py" ]]; then
+    LIB_DIR="${SCRIPT_DIR}/lib"
+elif [[ -f "${TOOLS_DIR}/lib/generate_report.py" ]]; then
+    LIB_DIR="${TOOLS_DIR}/lib"
+else
+    LIB_DIR="${SCRIPT_DIR}/lib"   # best-effort fallback
+fi
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; MAGENTA='\033[0;35m'
+BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+VERBOSE=true
+MODULES="all"
+ZIP_FILE=""
+SCAN_NAME=""
+SCAN_DIR=""
+EXTRACT_DIR=""
+REPORT_DIR=""
+DEBUG_DIR=""
+ERROR_LOG=""
+START_TS=0
+
+ALL_MODULES=(semgrep bandit pattern secrets gitleaks trivy dependency_check checkov codeql yara)
+SELECTED_MODULES=()
+FAILED_MODULES=()
+PASSED_MODULES=()
+SKIPPED_MODULES=()
+
+# ── AI Configuration ──────────────────────────────────────────────────────────
+CONFIGURE_AI=false
+USE_AI=false
+ENC_KEY=""
+AI_CONFIG_FILE="${HOME}/.sastscan_ai_config"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+log_banner() {
+    echo ""
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║         SAST Scanner  ─  Static Application Security Testing         ║${NC}"
+    echo -e "${BOLD}${CYAN}║                          Version ${VERSION}                              ║${NC}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+ts()         { date '+%H:%M:%S'; }
+log_info()   { echo -e "${BLUE}[INFO]${NC}    $(ts) │ $*"; }
+log_ok()     { echo -e "${GREEN}[OK]${NC}      $(ts) │ $*"; }
+log_warn()   { echo -e "${YELLOW}[WARN]${NC}    $(ts) │ $*"; }
+log_error()  { echo -e "${RED}[ERROR]${NC}   $(ts) │ $*" >&2; }
+log_skip()   { echo -e "${DIM}[SKIP]${NC}    $(ts) │ $*"; }
+log_mod()    { local m="${1^^}"; shift; printf "${MAGENTA}[%-17s]${NC} $(ts) │ %s\n" "${m}" "$*"; }
+log_vb()     { [[ "${VERBOSE}" == "true" ]] && echo -e "${DIM}[VERBOSE]${NC} $(ts) │ $*" || true; }
+log_sec()    {
+    echo ""
+    echo -e "${BOLD}${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "${BOLD}${CYAN}  $*${NC}"
+    echo -e "${BOLD}${CYAN}──────────────────────────────────────────────────────────────────────${NC}"
+    echo ""
+}
+
+# ── Usage / Version ───────────────────────────────────────────────────────────
+
+show_usage() {
+    echo ""
+    echo -e "${BOLD}Appu Corporation SAST Scanner${NC}"
+    echo ""
+    echo    "  Usage:  sastscan --zip <file.zip> --name <ScanName> [options]"
+    echo    "          sastscan --ConfigureAI"
+    echo ""
+    echo -e "${BOLD}  Required (scan mode)${NC}"
+    printf  "    %-32s %s\n"  "--zip/-z <path>"         "Path to the .zip archive containing source code."
+    printf  "    %-32s %s\n"  "--name/-n <name>"        "Label for this scan (used in output directory and report)."
+    echo ""
+    echo -e "${BOLD}  Options${NC}"
+    printf  "    %-32s %s\n"  "--modules/-m <list>"     "Comma-separated modules to run, or 'all'.  Default: all."
+    printf  "    %-32s %s\n"  ""                        "  Modules: semgrep, bandit, pattern, secrets, gitleaks,"
+    printf  "    %-32s %s\n"  ""                        "           trivy, dependency_check, checkov, codeql, yara"
+    printf  "    %-32s %s\n"  "--verbose/-v <bool>"     "Verbose output: true | false.  Default: true."
+    printf  "    %-32s %s\n"  "--version"               "Print version and exit."
+    printf  "    %-32s %s\n"  "--help/-h"               "Print this help and exit."
+    echo ""
+    echo -e "${BOLD}  AI Options${NC}"
+    printf  "    %-32s %s\n"  "--ConfigureAI"           "Interactive AI setup wizard (standalone — no scan needed)."
+    printf  "    %-32s %s\n"  ""                        "  Prompts for: URL, modelName, apiVersion, subscriptionKey, encKey."
+    printf  "    %-32s %s\n"  ""                        "  Config saved encrypted to ~/.sastscan_ai_config."
+    printf  "    %-32s %s\n"  "--useAI"                 "Enable AI-powered analysis after the scan.  Requires --encKey."
+    printf  "    %-32s %s\n"  ""                        "  Sends top findings to the configured AI endpoint."
+    printf  "    %-32s %s\n"  ""                        "  Adds ai_findings.csv and an AI Suggestions tab to the report."
+    printf  "    %-32s %s\n"  "--encKey <key>"          "Passphrase used to decrypt the AI configuration file."
+    echo ""
+    echo -e "${BOLD}  Report features (always active)${NC}"
+    printf  "    %-32s %s\n"  "Duplicate detection"    "Findings with the same file+line+rule are tagged DUPLICATE."
+    printf  "    %-32s %s\n"  ""                        "  Duplicates are kept in the report and can be hidden/shown."
+    echo ""
+    echo -e "${BOLD}  Examples${NC}"
+    printf  "    %s\n"  "sastscan --zip app.zip --name MyApp"
+    printf  "    %s\n"  "sastscan -z app.zip -n MyApp --modules semgrep,bandit,secrets"
+    printf  "    %s\n"  "sastscan -z app.zip -n MyApp --verbose false"
+    printf  "    %s\n"  "sastscan --ConfigureAI"
+    printf  "    %s\n"  "sastscan -z app.zip -n MyApp --useAI --encKey 'my-secret-passphrase'"
+    echo ""
+}
+
+show_version() {
+    echo "sastscan ${VERSION}"
+    echo "Open-source SAST Scanner — MIT License"
+}
+
+# ── AI Configuration ──────────────────────────────────────────────────────────
+
+configure_ai() {
+    log_sec "Configuring AI for SAST Scanning"
+    log_info "Configuration will be stored (encrypted) in: ${AI_CONFIG_FILE}"
+    echo ""
+
+    local ai_url ai_model ai_api_version ai_sub_key ai_enc_key ai_enc_key2
+
+    read -rp "  URL            : " ai_url
+    read -rp "  Model Name     : " ai_model
+    read -rp "  API Version    : " ai_api_version
+    read -rsp "  Subscription Key (hidden) : " ai_sub_key; echo ""
+    read -rsp "  Encryption Key  (hidden)  : " ai_enc_key;  echo ""
+    read -rsp "  Confirm Enc Key (hidden)  : " ai_enc_key2; echo ""
+
+    if [[ "${ai_enc_key}" != "${ai_enc_key2}" ]]; then
+        log_error "Encryption keys do not match"
+        exit 1
+    fi
+
+    if [[ -z "${ai_url}" || -z "${ai_model}" || -z "${ai_enc_key}" ]]; then
+        log_error "URL, Model Name, and Encryption Key are required"
+        exit 1
+    fi
+
+    log_info "Encrypting and saving configuration..."
+
+    SAST_AI_URL="${ai_url}" \
+    SAST_AI_MODEL="${ai_model}" \
+    SAST_AI_VER="${ai_api_version}" \
+    SAST_AI_SUBKEY="${ai_sub_key}" \
+    SAST_ENC_KEY="${ai_enc_key}" \
+    SAST_AI_CONFIG_FILE="${AI_CONFIG_FILE}" \
+    python3 << 'PYEOF'
+import os, sys, json, base64
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+except ImportError:
+    print("ERROR: 'cryptography' package required.  Run: pip3 install cryptography", file=sys.stderr)
+    sys.exit(1)
+
+def derive_key(password, salt):
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000)
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+enc_key    = os.environ["SAST_ENC_KEY"]
+out_file   = os.environ["SAST_AI_CONFIG_FILE"]
+config = {
+    "url":             os.environ.get("SAST_AI_URL",    ""),
+    "modelName":       os.environ.get("SAST_AI_MODEL",  ""),
+    "apiVersion":      os.environ.get("SAST_AI_VER",    ""),
+    "subscriptionKey": os.environ.get("SAST_AI_SUBKEY", ""),
+}
+
+salt    = os.urandom(16)
+key     = derive_key(enc_key, salt)
+token   = Fernet(key).encrypt(json.dumps(config).encode())
+payload = base64.b64encode(salt).decode() + ":" + token.decode()
+
+os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+with open(out_file, "w") as fh:
+    fh.write(payload)
+print(f"[OK] AI configuration saved to {out_file}")
+PYEOF
+
+    local rc=$?
+    if [[ ${rc} -eq 0 ]]; then
+        log_ok "AI configuration saved to: ${AI_CONFIG_FILE}"
+        log_info "Run future scans with:  sastscan --zip <file> --name <name> --useAI --encKey <key>"
+    else
+        log_error "Failed to save AI configuration"
+        exit 1
+    fi
+}
+
+# ── AI Scan ───────────────────────────────────────────────────────────────────
+
+run_ai_scan() {
+    log_sec "Running AI-Powered Analysis"
+
+    if [[ ! -f "${AI_CONFIG_FILE}" ]]; then
+        log_error "AI configuration not found.  Run: sastscan --ConfigureAI"
+        return 1
+    fi
+
+    local ai_scan_script="${LIB_DIR}/ai_scan.py"
+    if [[ ! -f "${ai_scan_script}" ]]; then
+        log_error "AI scan script not found: ${ai_scan_script}"
+        return 1
+    fi
+
+    local ai_csv="${REPORT_DIR}/ai_findings.csv"
+    log_info "Decrypting AI configuration and analysing findings..."
+
+    SAST_ENC_KEY="${ENC_KEY}" \
+    SAST_AI_CONFIG="${AI_CONFIG_FILE}" \
+    SAST_REPORT_DIR="${REPORT_DIR}" \
+    SAST_AI_CSV="${ai_csv}" \
+    SAST_EXTRACT_DIR="${EXTRACT_DIR}" \
+    python3 "${ai_scan_script}" 2>>"${ERROR_LOG}"
+
+    local rc=$?
+    if [[ ${rc} -ne 0 ]]; then
+        log_warn "AI analysis encountered errors — check ${ERROR_LOG}"
+        return 1
+    fi
+
+    if [[ -f "${ai_csv}" ]]; then
+        local cnt; cnt=$(wc -l < "${ai_csv}")
+        cnt=$((cnt - 1))
+        log_ok "AI analysis complete — ${cnt} suggestion(s) generated: ${ai_csv}"
+    else
+        log_warn "AI analysis produced no output"
+    fi
+}
+
+# ── Argument Parsing ──────────────────────────────────────────────────────────
+
+parse_args() {
+    [[ $# -eq 0 ]] && { show_usage; exit 1; }
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -z|--zip)        ZIP_FILE="$2";    shift 2 ;;
+            -n|--name)       SCAN_NAME="$2";   shift 2 ;;
+            -m|--modules)    MODULES="$2";     shift 2 ;;
+            -v|--verbose)    VERBOSE="$2";     shift 2 ;;
+            --ConfigureAI)   CONFIGURE_AI=true; shift ;;
+            --useAI|--useAi) USE_AI=true;      shift ;;
+            --encKey)        ENC_KEY="$2";     shift 2 ;;
+            --version)       show_version;     exit 0  ;;
+            -h|--help)       show_usage;       exit 0  ;;
+            *) log_error "Unknown option: $1"; show_usage; exit 1 ;;
+        esac
+    done
+}
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+validate_inputs() {
+    # --ConfigureAI is standalone — skip scan-related validation
+    [[ "${CONFIGURE_AI}" == "true" ]] && return
+
+    local errs=0
+    [[ -z "${ZIP_FILE}" ]]             && { log_error "--zip is required";            ((errs++)); }
+    [[ -n "${ZIP_FILE}" && ! -f "${ZIP_FILE}" ]] \
+                                       && { log_error "File not found: ${ZIP_FILE}";  ((errs++)); }
+    [[ -z "${SCAN_NAME}" ]]            && { log_error "--name is required";           ((errs++)); }
+    [[ "${VERBOSE}" != "true" && "${VERBOSE}" != "false" ]] \
+                                       && { log_warn "Invalid --verbose value; defaulting to 'true'"; VERBOSE=true; }
+    if [[ "${USE_AI}" == "true" && -z "${ENC_KEY}" ]]; then
+        log_error "--useAI requires --encKey <key>"
+        ((errs++))
+    fi
+    [[ ${errs} -gt 0 ]] && exit 1
+}
+
+resolve_modules() {
+    if [[ "${MODULES,,}" == "all" ]]; then
+        SELECTED_MODULES=("${ALL_MODULES[@]}")
+        return
+    fi
+    IFS=',' read -ra _req <<< "${MODULES,,}"
+    for m in "${_req[@]}"; do
+        m="${m//[[:space:]]/}"
+        local ok=false
+        for v in "${ALL_MODULES[@]}"; do [[ "$m" == "$v" ]] && ok=true && break; done
+        if $ok; then SELECTED_MODULES+=("$m")
+        else         log_warn "Unknown module '${m}' — skipping"; fi
+    done
+    [[ ${#SELECTED_MODULES[@]} -eq 0 ]] && { log_error "No valid modules selected"; exit 1; }
+}
+
+# ── Directory + Zip Setup ─────────────────────────────────────────────────────
+
+setup_dirs() {
+    local dt; dt=$(date '+%Y-%m-%d_%H-%M-%S')
+    SCAN_DIR="${SCAN_NAME}_${dt}"
+    EXTRACT_DIR="${SCAN_DIR}/Extracted"
+    REPORT_DIR="${SCAN_DIR}/Report"
+    DEBUG_DIR="${SCAN_DIR}/Debug"
+    ERROR_LOG="${DEBUG_DIR}/error.txt"
+
+    log_info "Creating scan workspace: ${SCAN_DIR}"
+    mkdir -p "${EXTRACT_DIR}" "${REPORT_DIR}" "${DEBUG_DIR}"
+
+    {   echo "=== sastscan Error / Debug Log ==="
+        echo "Scan   : ${SCAN_NAME}"
+        echo "Zip    : ${ZIP_FILE}"
+        echo "Date   : $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Host   : $(hostname)"
+        echo "User   : $(id -un)"
+        echo "=================================="
+        echo ""
+    } > "${ERROR_LOG}"
+
+    log_ok "Workspace ready"
+    log_vb "  Extracted : ${EXTRACT_DIR}"
+    log_vb "  Report    : ${REPORT_DIR}"
+    log_vb "  Debug     : ${DEBUG_DIR}"
+}
+
+extract_zip() {
+    log_info "Extracting: ${ZIP_FILE}"
+    if ! command -v unzip &>/dev/null; then
+        log_error "'unzip' not found. Install it: sudo apt-get install unzip"
+        exit 1
+    fi
+    if unzip -q "${ZIP_FILE}" -d "${EXTRACT_DIR}" 2>>"${ERROR_LOG}"; then
+        local cnt; cnt=$(find "${EXTRACT_DIR}" -type f | wc -l)
+        log_ok "Extracted ${cnt} file(s) → ${EXTRACT_DIR}"
+    else
+        log_error "Failed to extract ZIP (see ${ERROR_LOG})"
+        exit 1
+    fi
+}
+
+# ── CSV Helpers ───────────────────────────────────────────────────────────────
+
+csv_header() {
+    echo "Module,File,Line,Severity,RuleID,Category,Title,Description,CWE,Recommendation" > "$1"
+}
+
+# Escape a value for a CSV cell (wrap in quotes, escape inner quotes)
+_esc() { local v="${*//\"/\"\"}"; printf '"%s"' "${v}"; }
+
+# Append one row: module file line severity ruleid category title desc cwe rec
+csv_row() {
+    local f="$1"; shift
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(_esc "$1")" "$(_esc "$2")" "$(_esc "$3")" "$(_esc "$4")" \
+        "$(_esc "$5")" "$(_esc "$6")" "$(_esc "$7")" "$(_esc "$8")" \
+        "$(_esc "$9")" "$(_esc "${10:-}")" >> "${f}"
+}
+
+# ── Tool Path Helper ──────────────────────────────────────────────────────────
+tool_path() {
+    local name="$1"
+    local cand="${TOOLS_DIR}/bin/${name}"
+    command -v "${name}" 2>/dev/null || { [[ -x "${cand}" ]] && echo "${cand}"; }
+}
+
+# ── MODULE: Semgrep ───────────────────────────────────────────────────────────
+
+run_semgrep() {
+    local csv="${REPORT_DIR}/semgrep.csv"
+    local raw="${DEBUG_DIR}/semgrep_raw.json"
+    log_mod "semgrep" "Starting semantic analysis scan..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path semgrep)
+    if [[ -z "${bin}" ]]; then
+        log_skip "Semgrep not installed — run './install' first"
+        echo "[SEMGREP] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(semgrep); return
+    fi
+
+    local rules_dir="${TOOLS_DIR}/rules/semgrep"
+
+    # Directories that require Semgrep Pro (paid) and break the OSS scanner.
+    local _pro_only=(apex elixir)
+
+    # Build --config args from valid OSS rule directories only:
+    #   • skip hidden dirs (.github, .git, etc.)
+    #   • skip Semgrep Pro-only language dirs
+    #   • skip dirs that contain no YAML file with a 'rules:' key
+    local cfg_args=()
+    if [[ -d "${rules_dir}" ]]; then
+        while IFS= read -r -d '' d; do
+            local _name; _name=$(basename "${d}")
+            local _skip=false
+            for _p in "${_pro_only[@]}"; do
+                [[ "${_name}" == "${_p}" ]] && _skip=true && break
+            done
+            ${_skip} && continue
+            grep -rlq "^rules:" "${d}" \
+                --include="*.yaml" --include="*.yml" 2>/dev/null \
+                && cfg_args+=(--config "${d}")
+        done < <(find "${rules_dir}" -mindepth 1 -maxdepth 1 \
+                     -type d -not -name '.*' -print0 2>/dev/null)
+    fi
+    # Fall back to auto (requires internet) if no valid local dirs found
+    [[ ${#cfg_args[@]} -eq 0 ]] && cfg_args=(--config auto)
+
+    log_vb "Binary : ${bin}"
+    log_vb "Config : ${#cfg_args[@]} rule directories"
+    log_vb "Target : ${EXTRACT_DIR}"
+
+    "${bin}" --json --quiet "${cfg_args[@]}" "${EXTRACT_DIR}" > "${raw}" 2>>"${ERROR_LOG}" || true
+
+    if [[ ! -s "${raw}" ]]; then
+        log_warn "Semgrep produced no output"
+        FAILED_MODULES+=(semgrep); return
+    fi
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json, sys, csv as csvmod
+
+raw, out_csv, base = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = 0
+
+with open(raw, 'r', errors='replace') as fh:
+    try:
+        data = json.load(fh)
+    except Exception as e:
+        print(f"0", end="")
+        sys.exit(0)
+
+results = data.get("results", [])
+
+with open(out_csv, 'a', newline='', encoding='utf-8') as fh:
+    wr = csvmod.writer(fh, quoting=csvmod.QUOTE_ALL)
+    for r in results:
+        path  = r.get("path", "").replace(base.rstrip("/") + "/", "")
+        line  = str(r.get("start", {}).get("line", ""))
+        extra = r.get("extra", {})
+        sev   = (extra.get("severity") or r.get("severity") or "MEDIUM").upper()
+        rid   = r.get("check_id", "")
+        msg   = (extra.get("message") or "").replace("\n", " ")
+        meta  = extra.get("metadata", {})
+        cwe   = ", ".join(meta.get("cwe", [])) if isinstance(meta.get("cwe"), list) else str(meta.get("cwe", ""))
+        cat   = meta.get("category", "security")
+        fix   = meta.get("fix", "") or "Review and remediate finding"
+        wr.writerow(["Semgrep", path, line, sev, rid, cat, "Semgrep Finding", msg, cwe, fix])
+        rows += 1
+
+print(rows, end="")
+PYEOF
+    )
+    log_ok "Semgrep complete — ${count} finding(s)"
+    PASSED_MODULES+=(semgrep)
+}
+
+# ── MODULE: Bandit ────────────────────────────────────────────────────────────
+
+run_bandit() {
+    local csv="${REPORT_DIR}/bandit.csv"
+    local raw="${DEBUG_DIR}/bandit_raw.json"
+    log_mod "bandit" "Starting Python security analysis..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path bandit)
+    if [[ -z "${bin}" ]]; then
+        log_skip "Bandit not installed — run './install' first"
+        echo "[BANDIT] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(bandit); return
+    fi
+
+    # Check if there are Python files to scan
+    local py_count; py_count=$(find "${EXTRACT_DIR}" -name "*.py" 2>/dev/null | wc -l)
+    if [[ "${py_count}" -eq 0 ]]; then
+        log_skip "No Python files found — skipping Bandit"
+        SKIPPED_MODULES+=(bandit); return
+    fi
+
+    log_vb "Python files found: ${py_count}"
+
+    "${bin}" -r "${EXTRACT_DIR}" -f json -o "${raw}" -q 2>>"${ERROR_LOG}" || true
+
+    if [[ ! -s "${raw}" ]]; then
+        log_warn "Bandit produced no output"
+        FAILED_MODULES+=(bandit); return
+    fi
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json, sys, csv as csvmod
+
+raw, out_csv, base = sys.argv[1], sys.argv[2], sys.argv[3]
+rows = 0
+
+with open(raw, 'r', errors='replace') as fh:
+    try:
+        data = json.load(fh)
+    except Exception:
+        print("0", end=""); sys.exit(0)
+
+results = data.get("results", [])
+sev_map = {"HIGH": "HIGH", "MEDIUM": "MEDIUM", "LOW": "LOW"}
+
+with open(out_csv, 'a', newline='', encoding='utf-8') as fh:
+    wr = csvmod.writer(fh, quoting=csvmod.QUOTE_ALL)
+    for r in results:
+        path   = r.get("filename", "").replace(base.rstrip("/") + "/", "")
+        line   = str(r.get("line_number", ""))
+        sev    = sev_map.get(r.get("issue_severity", "").upper(), "MEDIUM")
+        rid    = r.get("test_id", "")
+        title  = r.get("test_name", "")
+        msg    = r.get("issue_text", "").replace("\n", " ")
+        cwe    = r.get("issue_cwe", {}).get("id", "") if isinstance(r.get("issue_cwe"), dict) else ""
+        cwe    = f"CWE-{cwe}" if cwe else ""
+        fix    = "Review Bandit documentation for " + rid
+        conf   = r.get("issue_confidence", "")
+        cat    = "security"
+        wr.writerow(["Bandit", path, line, sev, rid, cat, title, f"{msg} [Confidence: {conf}]", cwe, fix])
+        rows += 1
+
+print(rows, end="")
+PYEOF
+    )
+    log_ok "Bandit complete — ${count} finding(s)"
+    PASSED_MODULES+=(bandit)
+}
+
+# ── MODULE: Pattern ───────────────────────────────────────────────────────────
+
+run_pattern() {
+    local csv="${REPORT_DIR}/pattern.csv"
+    log_mod "pattern" "Starting custom pattern matching scan..."
+    csv_header "${csv}"
+
+    python3 - "${EXTRACT_DIR}" "${csv}" << 'PYEOF'
+import os, re, sys, csv as csvmod
+
+base_dir = sys.argv[1]
+out_csv  = sys.argv[2]
+
+PATTERNS = [
+    # Credentials & Secrets
+    ("CRED-001", "HIGH",   "Hardcoded Password",     r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']{4,}["\']',             "CWE-259", "Use environment variables or secret managers"),
+    ("CRED-002", "HIGH",   "Hardcoded Secret/Token",  r'(?i)(secret|token|api_key|apikey|auth_token)\s*[=:]\s*["\'][^"\']{8,}["\']', "CWE-798", "Store secrets in a vault or env vars"),
+    ("CRED-003", "MEDIUM", "Hardcoded Username",      r'(?i)(username|user_name|uname)\s*[=:]\s*["\'][^"\']{3,}["\']',       "CWE-798", "Avoid hardcoding usernames"),
+    ("CRED-004", "HIGH",   "Base64 Encoded Secret",   r'(?i)(password|secret|key)\s*[=:]\s*["\'][A-Za-z0-9+/]{20,}={0,2}["\']', "CWE-259", "Do not store encoded credentials in source"),
+
+    # Injection
+    ("INJ-001",  "HIGH",   "SQL Injection Risk",      r'(?i)(execute|exec|query|raw)\s*\(\s*["\'].*(%s|%d|\+|format|concat)', "CWE-89",  "Use parameterized queries / ORM"),
+    ("INJ-002",  "HIGH",   "Command Injection Risk",  r'(?i)(os\.system|subprocess\.call|subprocess\.run|popen|exec|eval)\s*\([^)]*(\+|format|\$\{)', "CWE-78", "Avoid shell=True; sanitize input"),
+    ("INJ-003",  "HIGH",   "Eval / Exec Usage",       r'(?<!\w)(eval|exec)\s*\(',                                              "CWE-95",  "Avoid eval/exec; use safer alternatives"),
+    ("INJ-004",  "MEDIUM", "LDAP Injection Risk",     r'(?i)ldap.*search.*\+',                                                "CWE-90",  "Sanitize LDAP inputs"),
+    ("INJ-005",  "HIGH",   "XSS Risk – innerHTML",    r'innerHTML\s*[+]?=',                                                   "CWE-79",  "Use textContent; sanitize user input"),
+    ("INJ-006",  "HIGH",   "XSS Risk – document.write", r'document\.write\s*\(',                                              "CWE-79",  "Avoid document.write with user-controlled data"),
+
+    # Path Traversal
+    ("PATH-001", "HIGH",   "Path Traversal Risk",     r'(?i)(open|file|read|include|require)\s*\(.*\.\.',                    "CWE-22",  "Validate and canonicalize file paths"),
+    ("PATH-002", "MEDIUM", "Unsanitized File Path",   r'(?i)(os\.path\.join|Path)\s*\(.*request\.',                          "CWE-22",  "Validate path components"),
+
+    # Crypto
+    ("CRYP-001", "HIGH",   "Weak Hash – MD5",         r'(?i)(md5|hashlib\.md5|MD5\.new)\s*\(',                               "CWE-327", "Use SHA-256 or stronger"),
+    ("CRYP-002", "HIGH",   "Weak Hash – SHA1",        r'(?i)(sha1|hashlib\.sha1|SHA\.new)\s*\(',                             "CWE-327", "Use SHA-256 or stronger"),
+    ("CRYP-003", "HIGH",   "Weak Cipher – DES/RC4",   r'(?i)(DES|RC4|Blowfish|arcfour)\s*[.(]',                             "CWE-327", "Use AES-256-GCM or ChaCha20"),
+    ("CRYP-004", "MEDIUM", "Insecure Random",         r'(?i)(random\.random|Math\.random|rand\(\))\b',                       "CWE-338", "Use cryptographically secure PRNG"),
+    ("CRYP-005", "MEDIUM", "Hardcoded IV/Salt",       r'(?i)(iv|salt|nonce)\s*[=:]\s*["\'][0-9a-fA-F]{8,}["\']',           "CWE-329", "Generate IV/Salt randomly"),
+
+    # Network/Auth
+    ("NET-001",  "HIGH",   "SSL Verification Disabled", r'(?i)(verify\s*=\s*False|ssl_verify\s*=\s*False|CERT_NONE)',       "CWE-295", "Enable certificate verification"),
+    ("NET-002",  "MEDIUM", "HTTP URL (not HTTPS)",     r'(?i)(http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0))',               "CWE-319", "Use HTTPS for all external connections"),
+    ("NET-003",  "HIGH",   "Hardcoded IP Address",     r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b', "CWE-547", "Externalize IP addresses to config"),
+
+    # Dangerous Functions
+    ("FUNC-001", "HIGH",   "Pickle Deserialization",  r'(?i)(pickle\.loads|cPickle\.loads)',                                 "CWE-502", "Avoid pickle for untrusted data; use JSON"),
+    ("FUNC-002", "HIGH",   "YAML unsafe_load",        r'yaml\.load\s*\([^)]*\)',                                            "CWE-502", "Use yaml.safe_load()"),
+    ("FUNC-003", "MEDIUM", "Assert Used for Security", r'(?i)assert\s+.*(auth|permission|admin|role|password)',             "CWE-617", "Use explicit checks instead of assert"),
+    ("FUNC-004", "HIGH",   "XXE – XML Parser",        r'(?i)(etree|minidom|sax|xmlrpc).*parse',                            "CWE-611", "Disable external entity processing"),
+    ("FUNC-005", "MEDIUM", "Debug/Print Sensitive Data", r'(?i)(print|log|console\.log)\s*\(.*password',                   "CWE-532", "Remove sensitive data from logs"),
+
+    # AWS/Cloud
+    ("CLOUD-001","HIGH",   "AWS Access Key Exposed",  r'AKIA[0-9A-Z]{16}',                                                  "CWE-798", "Rotate key; use IAM roles"),
+    ("CLOUD-002","HIGH",   "AWS Secret Key Pattern",  r'(?i)aws.{0,20}secret.{0,20}["\'][0-9a-zA-Z/+]{40}["\']',          "CWE-798", "Use AWS Secrets Manager"),
+    ("CLOUD-003","MEDIUM", "GCP Service Account Key", r'"type":\s*"service_account"',                                        "CWE-798", "Store GCP keys securely; use Workload Identity"),
+
+    # Miscellaneous
+    ("MISC-001", "LOW",    "TODO/FIXME Security Note", r'(?i)#.*(todo|fixme|hack|xxx).*(security|auth|crypt|secret)',      "",        "Address before production release"),
+    ("MISC-002", "MEDIUM", "Debug Mode Enabled",       r'(?i)(debug\s*=\s*True|DEBUG\s*=\s*True|app\.run.*debug)',         "CWE-215", "Disable debug mode in production"),
+    ("MISC-003", "HIGH",   "Open Redirect",            r'(?i)redirect\s*\(.*request\.(get|args|form)',                     "CWE-601", "Validate redirect targets against allowlist"),
+]
+
+TEXT_EXTS = {'.py','.js','.ts','.jsx','.tsx','.java','.go','.rb','.php','.cs','.cpp','.c',
+             '.h','.sh','.bash','.zsh','.ps1','.psm1','.yaml','.yml','.json','.xml',
+             '.html','.htm','.config','.cfg','.ini','.env','.tf','.hcl','.sql','.kt'}
+
+compiled = [(rid, sev, title, re.compile(pat), cwe, fix) for rid, sev, title, pat, cwe, fix in PATTERNS]
+rows = 0
+
+with open(out_csv, 'a', newline='', encoding='utf-8') as fh:
+    wr = csvmod.writer(fh, quoting=csvmod.QUOTE_ALL)
+
+    for root, dirs, files in os.walk(base_dir):
+        # Skip common non-source dirs
+        dirs[:] = [d for d in dirs if d not in {'.git','node_modules','__pycache__','.tox','venv','.venv','vendor'}]
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in TEXT_EXTS:
+                continue
+            fpath = os.path.join(root, fname)
+            rel   = fpath.replace(base_dir.rstrip("/") + "/", "")
+            try:
+                content = open(fpath, 'r', errors='replace').read()
+            except Exception:
+                continue
+            lines = content.splitlines()
+            for lineno, line in enumerate(lines, 1):
+                for rid, sev, title, pat, cwe, fix in compiled:
+                    if pat.search(line):
+                        snippet = line.strip()[:200]
+                        wr.writerow(["Pattern", rel, str(lineno), sev, rid, "pattern-match", title, snippet, cwe, fix])
+                        rows += 1
+
+print(rows, end="")
+PYEOF
+    local count="$?"
+    # Re-run to capture actual count from stdout
+    count=$(python3 - "${EXTRACT_DIR}" "${csv}" << 'PYEOF2'
+import os, re, sys, csv as csvmod
+
+base_dir = sys.argv[1]
+out_csv  = sys.argv[2]
+
+PATTERNS = [
+    ("CRED-001","HIGH","Hardcoded Password",r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']{4,}["\']',"CWE-259","Use environment variables or secret managers"),
+    ("CRED-002","HIGH","Hardcoded Secret/Token",r'(?i)(secret|token|api_key|apikey|auth_token)\s*[=:]\s*["\'][^"\']{8,}["\']',"CWE-798","Store secrets in a vault or env vars"),
+    ("CRED-003","MEDIUM","Hardcoded Username",r'(?i)(username|user_name|uname)\s*[=:]\s*["\'][^"\']{3,}["\']',"CWE-798","Avoid hardcoding usernames"),
+    ("CRED-004","HIGH","Base64 Encoded Secret",r'(?i)(password|secret|key)\s*[=:]\s*["\'][A-Za-z0-9+/]{20,}={0,2}["\']',"CWE-259","Do not store encoded credentials in source"),
+    ("INJ-001","HIGH","SQL Injection Risk",r'(?i)(execute|exec|query|raw)\s*\(\s*["\'].*(%s|%d|\+|format|concat)',"CWE-89","Use parameterized queries / ORM"),
+    ("INJ-002","HIGH","Command Injection Risk",r'(?i)(os\.system|subprocess\.call|subprocess\.run|popen|exec|eval)\s*\([^)]*(\+|format|\$\{)',"CWE-78","Avoid shell=True; sanitize input"),
+    ("INJ-003","HIGH","Eval / Exec Usage",r'(?<!\w)(eval|exec)\s*\(',"CWE-95","Avoid eval/exec; use safer alternatives"),
+    ("INJ-004","MEDIUM","LDAP Injection Risk",r'(?i)ldap.*search.*\+',"CWE-90","Sanitize LDAP inputs"),
+    ("INJ-005","HIGH","XSS Risk – innerHTML",r'innerHTML\s*[+]?=',"CWE-79","Use textContent; sanitize user input"),
+    ("INJ-006","HIGH","XSS Risk – document.write",r'document\.write\s*\(',"CWE-79","Avoid document.write with user-controlled data"),
+    ("PATH-001","HIGH","Path Traversal Risk",r'(?i)(open|file|read|include|require)\s*\(.*\.\.',"CWE-22","Validate and canonicalize file paths"),
+    ("PATH-002","MEDIUM","Unsanitized File Path",r'(?i)(os\.path\.join|Path)\s*\(.*request\.',"CWE-22","Validate path components"),
+    ("CRYP-001","HIGH","Weak Hash – MD5",r'(?i)(md5|hashlib\.md5|MD5\.new)\s*\(',"CWE-327","Use SHA-256 or stronger"),
+    ("CRYP-002","HIGH","Weak Hash – SHA1",r'(?i)(sha1|hashlib\.sha1|SHA\.new)\s*\(',"CWE-327","Use SHA-256 or stronger"),
+    ("CRYP-003","HIGH","Weak Cipher – DES/RC4",r'(?i)(DES|RC4|Blowfish|arcfour)\s*[.(]',"CWE-327","Use AES-256-GCM or ChaCha20"),
+    ("CRYP-004","MEDIUM","Insecure Random",r'(?i)(random\.random|Math\.random|rand\(\))\b',"CWE-338","Use cryptographically secure PRNG"),
+    ("CRYP-005","MEDIUM","Hardcoded IV/Salt",r'(?i)(iv|salt|nonce)\s*[=:]\s*["\'][0-9a-fA-F]{8,}["\']',"CWE-329","Generate IV/Salt randomly"),
+    ("NET-001","HIGH","SSL Verification Disabled",r'(?i)(verify\s*=\s*False|ssl_verify\s*=\s*False|CERT_NONE)',"CWE-295","Enable certificate verification"),
+    ("NET-002","MEDIUM","HTTP URL (not HTTPS)",r'(?i)(http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0))',"CWE-319","Use HTTPS for all external connections"),
+    ("NET-003","HIGH","Hardcoded IP Address",r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',"CWE-547","Externalize IP addresses to config"),
+    ("FUNC-001","HIGH","Pickle Deserialization",r'(?i)(pickle\.loads|cPickle\.loads)',"CWE-502","Avoid pickle for untrusted data; use JSON"),
+    ("FUNC-002","HIGH","YAML unsafe_load",r'yaml\.load\s*\([^)]*\)',"CWE-502","Use yaml.safe_load()"),
+    ("FUNC-003","MEDIUM","Assert Used for Security",r'(?i)assert\s+.*(auth|permission|admin|role|password)',"CWE-617","Use explicit checks instead of assert"),
+    ("FUNC-004","HIGH","XXE – XML Parser",r'(?i)(etree|minidom|sax|xmlrpc).*parse',"CWE-611","Disable external entity processing"),
+    ("FUNC-005","MEDIUM","Debug/Print Sensitive Data",r'(?i)(print|log|console\.log)\s*\(.*password',"CWE-532","Remove sensitive data from logs"),
+    ("CLOUD-001","HIGH","AWS Access Key Exposed",r'AKIA[0-9A-Z]{16}',"CWE-798","Rotate key; use IAM roles"),
+    ("CLOUD-002","HIGH","AWS Secret Key Pattern",r'(?i)aws.{0,20}secret.{0,20}["\'][0-9a-zA-Z/+]{40}["\']',"CWE-798","Use AWS Secrets Manager"),
+    ("CLOUD-003","MEDIUM","GCP Service Account Key",r'"type":\s*"service_account"',"CWE-798","Store GCP keys securely; use Workload Identity"),
+    ("MISC-001","LOW","TODO/FIXME Security Note",r'(?i)#.*(todo|fixme|hack|xxx).*(security|auth|crypt|secret)',"","Address before production release"),
+    ("MISC-002","MEDIUM","Debug Mode Enabled",r'(?i)(debug\s*=\s*True|DEBUG\s*=\s*True|app\.run.*debug)',"CWE-215","Disable debug mode in production"),
+    ("MISC-003","HIGH","Open Redirect",r'(?i)redirect\s*\(.*request\.(get|args|form)',"CWE-601","Validate redirect targets against allowlist"),
+]
+
+TEXT_EXTS={'.py','.js','.ts','.jsx','.tsx','.java','.go','.rb','.php','.cs','.cpp','.c','.h',
+           '.sh','.bash','.zsh','.ps1','.psm1','.yaml','.yml','.json','.xml','.html','.htm',
+           '.config','.cfg','.ini','.env','.tf','.hcl','.sql','.kt'}
+
+compiled=[(rid,sev,title,re.compile(pat),cwe,fix) for rid,sev,title,pat,cwe,fix in PATTERNS]
+rows=0
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for root,dirs,files in os.walk(base_dir):
+        dirs[:]=[d for d in dirs if d not in {'.git','node_modules','__pycache__','.tox','venv','.venv','vendor'}]
+        for fname in files:
+            ext=os.path.splitext(fname)[1].lower()
+            if ext not in TEXT_EXTS: continue
+            fpath=os.path.join(root,fname)
+            rel=fpath.replace(base_dir.rstrip("/")+"/","")
+            try: content=open(fpath,'r',errors='replace').read()
+            except: continue
+            for lineno,line in enumerate(content.splitlines(),1):
+                for rid,sev,title,pat,cwe,fix in compiled:
+                    if pat.search(line):
+                        wr.writerow(["Pattern",rel,str(lineno),sev,rid,"pattern-match",title,line.strip()[:200],cwe,fix])
+                        rows+=1
+print(rows,end="")
+PYEOF2
+    )
+    log_ok "Pattern scan complete — ${count} finding(s)"
+    PASSED_MODULES+=(pattern)
+}
+
+# ── MODULE: Secrets ───────────────────────────────────────────────────────────
+
+run_secrets() {
+    local csv="${REPORT_DIR}/secrets.csv"
+    log_mod "secrets" "Starting secrets detection scan..."
+    csv_header "${csv}"
+
+    local count
+    count=$(python3 - "${EXTRACT_DIR}" "${csv}" << 'PYEOF'
+import os, re, sys, csv as csvmod
+
+base_dir = sys.argv[1]
+out_csv  = sys.argv[2]
+
+SECRET_PATTERNS = [
+    ("SEC-001","CRITICAL","AWS Access Key ID",       r'(?<![A-Z0-9])(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])'),
+    ("SEC-002","CRITICAL","AWS Secret Access Key",   r'(?i)aws[_\-\s]*(secret|access)[_\-\s]*key[_\-\s]*[=:]\s*["\']?[A-Za-z0-9/+]{40}["\']?'),
+    ("SEC-003","CRITICAL","AWS Session Token",       r'(?i)aws[_\-\s]*session[_\-\s]*token[_\-\s]*[=:]\s*["\']?[A-Za-z0-9/+=]{100,}["\']?'),
+    ("SEC-004","CRITICAL","GitHub Personal Token",   r'ghp_[A-Za-z0-9]{36}'),
+    ("SEC-005","CRITICAL","GitHub OAuth Token",      r'gho_[A-Za-z0-9]{36}'),
+    ("SEC-006","CRITICAL","GitHub App Token",        r'(ghu_|ghs_)[A-Za-z0-9]{36}'),
+    ("SEC-007","CRITICAL","GitLab Personal Token",   r'glpat-[A-Za-z0-9\-_]{20}'),
+    ("SEC-008","CRITICAL","Slack Bot Token",         r'xoxb-[0-9]{11}-[0-9]{11}-[A-Za-z0-9]{24}'),
+    ("SEC-009","CRITICAL","Slack User Token",        r'xoxp-[0-9]{11}-[0-9]{11}-[0-9]{11}-[A-Za-z0-9]{32}'),
+    ("SEC-010","HIGH",    "Stripe Secret Key",       r'sk_live_[A-Za-z0-9]{24,}'),
+    ("SEC-011","HIGH",    "Stripe Publishable Key",  r'pk_live_[A-Za-z0-9]{24,}'),
+    ("SEC-012","CRITICAL","Stripe Test Secret",      r'sk_test_[A-Za-z0-9]{24,}'),
+    ("SEC-013","HIGH",    "Twilio Auth Token",       r'(?i)twilio.*[0-9a-f]{32}'),
+    ("SEC-014","HIGH",    "SendGrid API Key",        r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}'),
+    ("SEC-015","CRITICAL","Private Key (PEM)",       r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
+    ("SEC-016","HIGH",    "Certificate (PEM)",       r'-----BEGIN CERTIFICATE-----'),
+    ("SEC-017","CRITICAL","Generic Password Field",  r'(?i)(^|[\s,;])(password|passwd|pwd|secret)\s*[=:]\s*["\'][^"\']{6,}["\']'),
+    ("SEC-018","HIGH",    "Generic API Key",         r'(?i)(api[_\-]?key|apikey)[_\-\s]*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}["\']?'),
+    ("SEC-019","HIGH",    "Generic Auth Token",      r'(?i)(auth[_\-]?token|access[_\-]?token)[_\-\s]*[=:]\s*["\']?[A-Za-z0-9_\-\.]{16,}["\']?'),
+    ("SEC-020","CRITICAL","JWT Token",               r'eyJ[A-Za-z0-9\-_]+\.eyJ[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+'),
+    ("SEC-021","HIGH",    "Google API Key",          r'AIza[0-9A-Za-z_\-]{35}'),
+    ("SEC-022","HIGH",    "Google OAuth Token",      r'ya29\.[A-Za-z0-9_\-]{50,}'),
+    ("SEC-023","HIGH",    "Firebase URL",            r'https://[a-z0-9\-]+\.firebaseio\.com'),
+    ("SEC-024","HIGH",    "Database Connection String",r'(?i)(mysql|postgresql|postgres|mssql|mongodb|redis)://[^\s"\']+:[^\s"\']+@'),
+    ("SEC-025","MEDIUM",  "Basic Auth in URL",       r'https?://[^:]+:[^@]+@'),
+    ("SEC-026","HIGH",    "NPM Token",               r'npm_[A-Za-z0-9]{36}'),
+    ("SEC-027","HIGH",    "PyPI Token",              r'pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]+'),
+    ("SEC-028","HIGH",    "Azure Storage Key",       r'(?i)(DefaultEndpointsProtocol|AccountKey=)[^"\';\n]+'),
+    ("SEC-029","HIGH",    "Telegram Bot Token",      r'[0-9]{8,10}:[A-Za-z0-9_\-]{35}'),
+    ("SEC-030","MEDIUM",  "Email in Source Code",    r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'),
+]
+
+SKIP_EXTS = {'.png','.jpg','.jpeg','.gif','.bmp','.ico','.svg','.woff','.woff2',
+             '.ttf','.eot','.otf','.mp4','.mp3','.avi','.zip','.tar','.gz',
+             '.pyc','.class','.jar','.so','.dll','.exe','.bin','.pdf'}
+
+compiled = [(rid,sev,title,re.compile(pat)) for rid,sev,title,pat in SECRET_PATTERNS]
+rows = 0
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr = csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for root,dirs,files in os.walk(base_dir):
+        dirs[:]=[d for d in dirs if d not in {'.git','node_modules','__pycache__','venv','.venv'}]
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SKIP_EXTS: continue
+            fpath = os.path.join(root,fname)
+            rel   = fpath.replace(base_dir.rstrip("/")+"/","")
+            try:
+                content = open(fpath,'r',errors='replace').read()
+            except: continue
+            for lineno,line in enumerate(content.splitlines(),1):
+                for rid,sev,title,pat in compiled:
+                    if pat.search(line):
+                        # Redact the actual secret in the description
+                        desc = f"Potential {title} detected"
+                        wr.writerow(["Secrets",rel,str(lineno),sev,rid,"secret-detection",title,desc,"CWE-798","Remove from source; rotate credential immediately"])
+                        rows+=1
+                        break  # One finding per line per file to avoid duplicate noise
+
+print(rows,end="")
+PYEOF
+    )
+    log_ok "Secrets scan complete — ${count} finding(s)"
+    PASSED_MODULES+=(secrets)
+}
+
+# ── MODULE: Gitleaks ──────────────────────────────────────────────────────────
+
+run_gitleaks() {
+    local csv="${REPORT_DIR}/gitleaks.csv"
+    local raw="${DEBUG_DIR}/gitleaks_raw.json"
+    log_mod "gitleaks" "Starting git secrets scan..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path gitleaks)
+    if [[ -z "${bin}" ]]; then
+        log_skip "Gitleaks not installed — run './install' first"
+        echo "[GITLEAKS] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(gitleaks); return
+    fi
+
+    log_vb "Binary: ${bin}"
+
+    "${bin}" detect --source="${EXTRACT_DIR}" \
+        --report-format=json --report-path="${raw}" \
+        --no-git --exit-code 0 \
+        2>>"${ERROR_LOG}" || true
+
+    if [[ ! -s "${raw}" ]]; then
+        log_ok "Gitleaks — no secrets found (or non-git source)"
+        echo "Gitleaks" > /dev/null
+        csv_row "${csv}" "Gitleaks" "" "" "INFO" "" "" "No secrets detected" "" "" ""
+        PASSED_MODULES+=(gitleaks); return
+    fi
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json,sys,csv as csvmod
+
+raw,out_csv,base=sys.argv[1],sys.argv[2],sys.argv[3]
+rows=0
+
+with open(raw,'r',errors='replace') as fh:
+    try: data=json.load(fh)
+    except: print("0",end=""); sys.exit(0)
+
+if not isinstance(data,list): data=[]
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for r in data:
+        path  = r.get("File","").replace(base.rstrip("/")+"/","")
+        line  = str(r.get("StartLine",""))
+        rid   = r.get("RuleID","")
+        title = r.get("Description","Gitleaks Finding")
+        sev   = "HIGH"
+        desc  = f"Secret match for rule '{rid}' — value redacted"
+        wr.writerow(["Gitleaks",path,line,sev,rid,"secret-detection",title,desc,"CWE-798","Rotate credential; remove from source"])
+        rows+=1
+
+print(rows,end="")
+PYEOF
+    )
+    log_ok "Gitleaks complete — ${count} finding(s)"
+    PASSED_MODULES+=(gitleaks)
+}
+
+# ── MODULE: Trivy ─────────────────────────────────────────────────────────────
+
+run_trivy() {
+    local csv="${REPORT_DIR}/trivy.csv"
+    local raw="${DEBUG_DIR}/trivy_raw.json"
+    log_mod "trivy" "Starting filesystem vulnerability scan..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path trivy)
+    if [[ -z "${bin}" ]]; then
+        log_skip "Trivy not installed — run './install' first"
+        echo "[TRIVY] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(trivy); return
+    fi
+
+    log_vb "Binary: ${bin}"
+
+    "${bin}" fs --format json --output "${raw}" \
+        --security-checks vuln,config,secret \
+        --quiet "${EXTRACT_DIR}" 2>>"${ERROR_LOG}" || true
+
+    if [[ ! -s "${raw}" ]]; then
+        log_warn "Trivy produced no output"
+        FAILED_MODULES+=(trivy); return
+    fi
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json,sys,csv as csvmod
+
+raw,out_csv,base=sys.argv[1],sys.argv[2],sys.argv[3]
+rows=0
+
+with open(raw,'r',errors='replace') as fh:
+    try: data=json.load(fh)
+    except: print("0",end=""); sys.exit(0)
+
+results=data.get("Results",[])
+
+SEV_MAP={"CRITICAL":"CRITICAL","HIGH":"HIGH","MEDIUM":"MEDIUM","LOW":"LOW","UNKNOWN":"INFO"}
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for res in results:
+        target=res.get("Target","").replace(base.rstrip("/")+"/","")
+        for v in res.get("Vulnerabilities",[]):
+            vid   = v.get("VulnerabilityID","")
+            pkg   = v.get("PkgName","")
+            sev   = SEV_MAP.get(v.get("Severity","MEDIUM").upper(),"MEDIUM")
+            title = v.get("Title","") or f"Vulnerability in {pkg}"
+            desc  = (v.get("Description","") or "").replace("\n"," ")[:300]
+            cvss  = str(v.get("CVSS",{}).get("nvd",{}).get("V3Score","") or "")
+            fix   = f"Upgrade {pkg} to {v.get('FixedVersion','latest')}"
+            cwe   = ", ".join(v.get("CweIDs",[]))
+            wr.writerow(["Trivy",target,"",sev,vid,"vulnerability",title,f"{desc} [CVSS:{cvss}]",cwe,fix])
+            rows+=1
+        for m in res.get("Misconfigurations",[]):
+            mid   = m.get("ID","")
+            sev   = SEV_MAP.get(m.get("Severity","MEDIUM").upper(),"MEDIUM")
+            title = m.get("Title","")
+            desc  = (m.get("Description","") or "").replace("\n"," ")[:300]
+            fix   = m.get("Resolution","Review configuration")
+            wr.writerow(["Trivy",target,"",sev,mid,"misconfiguration",title,desc,"",fix])
+            rows+=1
+
+print(rows,end="")
+PYEOF
+    )
+    log_ok "Trivy complete — ${count} finding(s)"
+    PASSED_MODULES+=(trivy)
+}
+
+# ── MODULE: Dependency Check ──────────────────────────────────────────────────
+
+run_dependency_check() {
+    local csv="${REPORT_DIR}/dependency_check.csv"
+    local raw="${DEBUG_DIR}/dependency_check_raw.json"
+    local dc_dir="${TOOLS_DIR}/dependency-check"
+    log_mod "dependency_check" "Starting OWASP Dependency Check scan..."
+    csv_header "${csv}"
+
+    local bin="${dc_dir}/bin/dependency-check.sh"
+    if [[ ! -x "${bin}" ]]; then
+        log_skip "OWASP Dependency Check not installed — run './install' first"
+        echo "[DEPENDENCY-CHECK] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(dependency_check); return
+    fi
+
+    log_vb "Binary: ${bin}"
+
+    # H2 requires write access to odc.mv.db; if the shared data dir is root-owned,
+    # keep a persistent user-owned copy and point --data at it instead.
+    local dc_extra_args=()
+    if [[ ! -w "${dc_dir}/data/odc.mv.db" ]]; then
+        local dc_user_data="${HOME}/.cache/sastscan/dc_data"
+        if [[ ! -f "${dc_user_data}/odc.mv.db" ]] || \
+           [[ "${dc_dir}/data/odc.mv.db" -nt "${dc_user_data}/odc.mv.db" ]]; then
+            log_vb "NVD database not writable — copying to user cache (first run may take ~30s)..."
+            mkdir -p "${dc_user_data}"
+            cp -a "${dc_dir}/data/." "${dc_user_data}/" 2>>"${ERROR_LOG}"
+        fi
+        dc_extra_args+=(--data "${dc_user_data}")
+    fi
+
+    "${bin}" \
+        --scan "${EXTRACT_DIR}" \
+        --format JSON \
+        --out "${DEBUG_DIR}/dc_report" \
+        --project "${SCAN_NAME}" \
+        --noupdate \
+        --disableAssembly \
+        "${dc_extra_args[@]}" \
+        >> "${ERROR_LOG}" 2>&1 || true
+
+    local json_out="${DEBUG_DIR}/dc_report/dependency-check-report.json"
+    if [[ ! -f "${json_out}" ]]; then
+        log_warn "Dependency Check produced no JSON output"
+        FAILED_MODULES+=(dependency_check); return
+    fi
+
+    cp "${json_out}" "${raw}"
+
+    local dc_count
+    dc_count=$(python3 - "${raw}" "${csv}" << 'PYEOF'
+import json,sys,csv as csvmod,os
+
+raw,out_csv=sys.argv[1],sys.argv[2]
+rows=0
+
+with open(raw,'r',errors='replace') as fh:
+    try: data=json.load(fh)
+    except: print("0",end=""); sys.exit(0)
+
+deps=data.get("dependencies",[])
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for dep in deps:
+        fname=dep.get("fileName","")
+        for vuln in dep.get("vulnerabilities",[]):
+            vid   = vuln.get("name","")
+            sev   = vuln.get("severity","MEDIUM").upper()
+            desc  = (vuln.get("description","") or "").replace("\n"," ")[:300]
+            cvss  = str(vuln.get("cvssv3",{}).get("baseScore","") or vuln.get("cvssv2",{}).get("score",""))
+            cwe   = vuln.get("cwes",[""])[0] if vuln.get("cwes") else ""
+            title = f"CVE in {os.path.basename(fname)}" if fname else vid
+            fix   = vuln.get("solution","Update to patched version") or "Update to patched version"
+            wr.writerow(["DependencyCheck",fname,"",sev,vid,"dependency-vulnerability",vid,f"{desc} [CVSS:{cvss}]",cwe,fix])
+            rows+=1
+
+print(rows,end="")
+PYEOF
+    )
+
+    # ── npm / Node.js: query OSV API for each package.json found ────────────────
+    # OWASP DC's NVD database has poor CPE coverage for npm packages.
+    # The OSV API (osv.dev) is authoritative for npm CVEs and requires no
+    # local tooling — only a package.json and network access.
+    local npm_count=0
+    while IFS= read -r -d '' pkgjson; do
+        [[ -s "${pkgjson}" ]] || continue
+        log_vb "npm OSV scan: $(basename "$(dirname "${pkgjson}")")/package.json"
+        local n
+        n=$(python3 - "${pkgjson}" "${csv}" "${EXTRACT_DIR}" 2>>"${ERROR_LOG}" << 'NPM_OSV_EOF'
+import json, sys, csv as csvmod, re
+import urllib.request, urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+pkgjson_path = sys.argv[1]
+out_csv      = sys.argv[2]
+base         = sys.argv[3].rstrip("/")
+
+try:
+    with open(pkgjson_path) as f:
+        pkg = json.load(f)
+except Exception as e:
+    print(f"[OSV] parse error: {e}", file=sys.stderr)
+    print("0", end=""); sys.exit(0)
+
+deps = {}
+deps.update(pkg.get("dependencies", {}))
+deps.update(pkg.get("devDependencies", {}))
+
+if not deps:
+    print("0", end=""); sys.exit(0)
+
+queries  = []
+pkg_info = []
+
+for name, ver_spec in deps.items():
+    ver = ver_spec.strip()
+    m = re.search(r'\d+\.\d+[\.\d]*', ver)
+    if not m or "://" in ver or ver.startswith("git"):
+        continue
+    ver = m.group(0)
+    queries.append({"version": ver, "package": {"name": name, "ecosystem": "npm"}})
+    pkg_info.append((name, ver))
+
+if not queries:
+    print("0", end=""); sys.exit(0)
+
+# Step 1: batch query — find which packages have known vulnerabilities
+try:
+    payload = json.dumps({"queries": queries}).encode()
+    req = urllib.request.Request(
+        "https://api.osv.dev/v1/querybatch",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        batch = json.loads(resp.read())
+except urllib.error.URLError as e:
+    print(f"[OSV] Network error — npm scan skipped: {e}", file=sys.stderr)
+    print("0", end=""); sys.exit(0)
+except Exception as e:
+    print(f"[OSV] Error: {e}", file=sys.stderr)
+    print("0", end=""); sys.exit(0)
+
+# Collect all GHSA/OSV IDs returned, mapped to their package
+pending = {}   # osv_id → (pkg_name, pkg_ver)
+for i, result in enumerate(batch.get("results", [])):
+    if i >= len(pkg_info):
+        break
+    pkg_name, pkg_ver = pkg_info[i]
+    for vuln in result.get("vulns", []):
+        osv_id = vuln.get("id", "")
+        if osv_id:
+            pending[osv_id] = (pkg_name, pkg_ver)
+
+if not pending:
+    print("0", end=""); sys.exit(0)
+
+# Step 2: fetch full vuln records in parallel to get CVE aliases + accurate severity
+def fetch_vuln(osv_id):
+    try:
+        url = f"https://api.osv.dev/v1/vulns/{osv_id}"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            return osv_id, json.loads(r.read())
+    except Exception:
+        return osv_id, {}
+
+vuln_details = {}
+with ThreadPoolExecutor(max_workers=10) as ex:
+    for osv_id, detail in ex.map(fetch_vuln, pending.keys()):
+        vuln_details[osv_id] = detail
+
+SEV_MAP = {"CRITICAL":"CRITICAL","HIGH":"HIGH","MODERATE":"MEDIUM",
+           "MEDIUM":"MEDIUM","LOW":"LOW"}
+seen  = set()
+rows  = 0
+rel_path = pkgjson_path.replace(base + "/", "", 1)
+
+with open(out_csv, "a", newline="", encoding="utf-8") as fh:
+    wr = csvmod.writer(fh, quoting=csvmod.QUOTE_ALL)
+    for osv_id, (pkg_name, pkg_ver) in pending.items():
+        detail = vuln_details.get(osv_id, {})
+        aliases = detail.get("aliases", [])
+        # Prefer CVE ID; fall back to GHSA/OSV ID
+        vid = next((a for a in aliases if a.startswith("CVE-")), osv_id)
+        key = f"{pkg_name}:{vid}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Severity: prefer database_specific, fall back to HIGH for npm
+        sev = "HIGH"
+        db_sev = detail.get("database_specific", {}).get("severity", "")
+        if db_sev:
+            sev = SEV_MAP.get(db_sev.upper(), "HIGH")
+        else:
+            for aff in detail.get("affected", []):
+                s = aff.get("database_specific", {}).get("severity", "")
+                if s:
+                    sev = SEV_MAP.get(s.upper(), "HIGH")
+                    break
+
+        title = (detail.get("summary", "") or vid)[:200]
+        desc  = (detail.get("details",  "") or "").replace("\n", " ")[:300]
+        cwes  = detail.get("database_specific", {}).get("cwe_ids", [])
+        cwe   = "; ".join(cwes)
+        fix   = f"Update {pkg_name} (currently {pkg_ver}) to a patched version"
+
+        wr.writerow([
+            "DependencyCheck", rel_path, "", sev, vid,
+            "dependency-vulnerability", title,
+            f"{desc} [npm:{pkg_name}@{pkg_ver}]"[:300],
+            cwe, fix
+        ])
+        rows += 1
+
+print(rows, end="")
+NPM_OSV_EOF
+        ) || true
+        npm_count=$(( npm_count + ${n:-0} ))
+    done < <(find "${EXTRACT_DIR}" -name "package.json" \
+        -not -path "*/node_modules/*" -print0 2>/dev/null)
+
+    local total=$(( ${dc_count:-0} + npm_count ))
+    log_ok "Dependency Check complete — ${total} finding(s) (DC:${dc_count:-0} npm-OSV:${npm_count})"
+    PASSED_MODULES+=(dependency_check)
+}
+
+# ── MODULE: Checkov ───────────────────────────────────────────────────────────
+
+run_checkov() {
+    local csv="${REPORT_DIR}/checkov.csv"
+    local raw="${DEBUG_DIR}/checkov_raw.json"
+    log_mod "checkov" "Starting IaC security scan..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path checkov)
+    if [[ -z "${bin}" ]]; then
+        log_skip "Checkov not installed — run './install' first"
+        echo "[CHECKOV] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(checkov); return
+    fi
+
+    log_vb "Binary: ${bin}"
+
+    "${bin}" -d "${EXTRACT_DIR}" \
+        -o json --output-file-path "${DEBUG_DIR}" \
+        --quiet --compact \
+        2>>"${ERROR_LOG}" || true
+
+    # Checkov writes results.json to output directory
+    local json_out="${DEBUG_DIR}/results_json.json"
+    [[ ! -f "${json_out}" ]] && json_out="${DEBUG_DIR}/checkov_results.json"
+
+    # Try running with stdout capture if file not found
+    if [[ ! -f "${json_out}" ]]; then
+        "${bin}" -d "${EXTRACT_DIR}" -o json --quiet --compact > "${raw}" 2>>"${ERROR_LOG}" || true
+        json_out="${raw}"
+    fi
+
+    if [[ ! -s "${json_out}" ]]; then
+        log_warn "Checkov produced no output"
+        FAILED_MODULES+=(checkov); return
+    fi
+
+    cp "${json_out}" "${raw}" 2>/dev/null || true
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json,sys,csv as csvmod
+
+raw,out_csv,base=sys.argv[1],sys.argv[2],sys.argv[3]
+rows=0
+
+with open(raw,'r',errors='replace') as fh:
+    try: content=fh.read().strip()
+    except: print("0",end=""); sys.exit(0)
+
+# Checkov can output multiple JSON objects concatenated
+import re
+objects=[]
+try:
+    # Try as single object or array
+    data=json.loads(content)
+    if isinstance(data,list): objects=data
+    else: objects=[data]
+except:
+    # Try to extract JSON objects
+    for chunk in re.split(r'\n(?=\{)',content):
+        try: objects.append(json.loads(chunk))
+        except: pass
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for obj in objects:
+        results=obj.get("results",{}) if isinstance(obj,dict) else {}
+        failed=results.get("failed_checks",[]) if results else []
+        for r in failed:
+            check=r.get("check",{}) if isinstance(r.get("check"),dict) else {}
+            path =r.get("repo_file_path","") or r.get("file_path","")
+            path =path.replace(base.rstrip("/")+"/","")
+            line =str(r.get("file_line_range",[0])[0]) if r.get("file_line_range") else ""
+            rid  =check.get("id","") or r.get("check_id","")
+            title=check.get("name","") or r.get("check","")
+            sev  =r.get("severity","MEDIUM") or "MEDIUM"
+            if isinstance(sev,str): sev=sev.upper()
+            else: sev="MEDIUM"
+            wr.writerow(["Checkov",path,line,sev,rid,"iac-misconfiguration",title,f"IaC check failed: {rid}","",f"See Checkov docs for {rid}"])
+            rows+=1
+
+print(rows,end="")
+PYEOF
+    )
+    log_ok "Checkov complete — ${count} finding(s)"
+    PASSED_MODULES+=(checkov)
+}
+
+# ── MODULE: CodeQL ────────────────────────────────────────────────────────────
+
+run_codeql() {
+    local csv="${REPORT_DIR}/codeql.csv"
+    local raw="${DEBUG_DIR}/codeql_raw.sarif"
+    local codeql_dir="${TOOLS_DIR}/codeql"
+    log_mod "codeql" "Starting CodeQL analysis..."
+    csv_header "${csv}"
+
+    local bin="${codeql_dir}/codeql"
+    if [[ ! -x "${bin}" ]]; then
+        log_skip "CodeQL not installed — run './install' first"
+        echo "[CODEQL] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(codeql); return
+    fi
+
+    local db_dir="${DEBUG_DIR}/codeql_db"
+    local lang=""
+
+    # Auto-detect primary language
+    local py_c; py_c=$(find "${EXTRACT_DIR}" -name "*.py" 2>/dev/null | wc -l)
+    local js_c; js_c=$(find "${EXTRACT_DIR}" -name "*.js" -o -name "*.ts" 2>/dev/null | wc -l)
+    local java_c; java_c=$(find "${EXTRACT_DIR}" -name "*.java" 2>/dev/null | wc -l)
+    local go_c; go_c=$(find "${EXTRACT_DIR}" -name "*.go" 2>/dev/null | wc -l)
+
+    if   [[ ${py_c}   -gt 0 ]]; then lang="python"
+    elif [[ ${js_c}   -gt 0 ]]; then lang="javascript"
+    elif [[ ${java_c} -gt 0 ]]; then lang="java"
+    elif [[ ${go_c}   -gt 0 ]]; then lang="go"
+    else
+        log_skip "CodeQL — no supported language files found (python/js/java/go)"
+        SKIPPED_MODULES+=(codeql); return
+    fi
+
+    log_vb "Detected language: ${lang}"
+
+    # Resolve the versioned .qls path (e.g. python-queries/1.8.0/codeql-suites/...)
+    local qls_file
+    qls_file=$(find "${codeql_dir}/qlpacks/codeql/${lang}-queries" \
+        -name "${lang}-security-extended.qls" -path "*/codeql-suites/*" 2>/dev/null | head -1)
+    if [[ -z "${qls_file}" ]]; then
+        log_warn "CodeQL — query suite not found for language: ${lang}"
+        echo "[CODEQL] Query suite missing: ${codeql_dir}/qlpacks/codeql/${lang}-queries/**/codeql-suites/${lang}-security-extended.qls" >> "${ERROR_LOG}"
+        FAILED_MODULES+=(codeql); return
+    fi
+    log_vb "Query suite: ${qls_file}"
+    log_vb "Creating CodeQL database (this may take a few minutes)..."
+
+    "${bin}" database create "${db_dir}" \
+        --language="${lang}" \
+        --source-root="${EXTRACT_DIR}" \
+        --overwrite \
+        2>>"${ERROR_LOG}" || { log_warn "CodeQL database creation failed"; FAILED_MODULES+=(codeql); return; }
+
+    log_vb "Running CodeQL analysis..."
+
+    "${bin}" database analyze "${db_dir}" \
+        --format=sarif-latest \
+        --output="${raw}" \
+        "${qls_file}" \
+        2>>"${ERROR_LOG}" || { log_warn "CodeQL analysis failed"; FAILED_MODULES+=(codeql); return; }
+
+    if [[ ! -s "${raw}" ]]; then
+        log_warn "CodeQL produced no SARIF output"
+        FAILED_MODULES+=(codeql); return
+    fi
+
+    local count
+    count=$(python3 - "${raw}" "${csv}" "${EXTRACT_DIR}" << 'PYEOF'
+import json,sys,csv as csvmod
+
+sarif,out_csv,base=sys.argv[1],sys.argv[2],sys.argv[3]
+rows=0
+
+with open(sarif,'r',errors='replace') as fh:
+    try: data=json.load(fh)
+    except: print("0",end=""); sys.exit(0)
+
+SEV={"error":"HIGH","warning":"MEDIUM","note":"LOW","none":"INFO"}
+
+with open(out_csv,'a',newline='',encoding='utf-8') as fh:
+    wr=csvmod.writer(fh,quoting=csvmod.QUOTE_ALL)
+    for run in data.get("runs",[]):
+        rules={r["id"]:r for r in run.get("tool",{}).get("driver",{}).get("rules",[])}
+        for res in run.get("results",[]):
+            rid   = res.get("ruleId","")
+            rule  = rules.get(rid,{})
+            sev   = SEV.get(res.get("kind","warning"),"MEDIUM")
+            title = rule.get("name","") or rid
+            msg   = res.get("message",{}).get("text","").replace("\n"," ")
+            for loc in res.get("locations",[]):
+                phys = loc.get("physicalLocation",{})
+                path = phys.get("artifactLocation",{}).get("uri","").replace(base.rstrip("/")+"/","")
+                line = str(phys.get("region",{}).get("startLine",""))
+                cwe  = "; ".join(t.get("id","") for t in rule.get("properties",{}).get("tags",[]) if t.get("id","").startswith("CWE"))
+                wr.writerow(["CodeQL",path,line,sev,rid,"codeql",title,msg,cwe,f"See CodeQL docs for {rid}"])
+                rows+=1
+
+print(rows,end="")
+PYEOF
+    )
+    log_ok "CodeQL complete — ${count} finding(s)"
+    PASSED_MODULES+=(codeql)
+}
+
+# ── MODULE: YARA ──────────────────────────────────────────────────────────────
+
+run_yara() {
+    local csv="${REPORT_DIR}/yara.csv"
+    log_mod "yara" "Starting YARA pattern scan..."
+    csv_header "${csv}"
+
+    local bin; bin=$(tool_path yara)
+    if [[ -z "${bin}" ]]; then
+        log_skip "YARA not installed — run './install' first"
+        echo "[YARA] Not installed" >> "${ERROR_LOG}"
+        SKIPPED_MODULES+=(yara); return
+    fi
+
+    local rules_dir="${TOOLS_DIR}/rules/yara"
+    if [[ ! -d "${rules_dir}" ]]; then
+        log_skip "YARA rules not found at ${rules_dir} — run './install' first"
+        SKIPPED_MODULES+=(yara); return
+    fi
+
+    log_vb "Binary: ${bin}"
+    log_vb "Rules : ${rules_dir}"
+
+    local count=0
+
+    while IFS= read -r -d '' rule_file; do
+        local rule_name; rule_name=$(basename "${rule_file}" .yar)
+        local tmp_out; tmp_out=$(mktemp)
+
+        # -s prints matched strings with byte offsets (0xOFFSET:$var: content)
+        # which lets us derive exact line numbers
+        "${bin}" -r -w -s "${rule_file}" "${EXTRACT_DIR}" > "${tmp_out}" 2>>"${ERROR_LOG}" || true
+
+        count=$(python3 - "${tmp_out}" "${csv}" "${EXTRACT_DIR}" \
+                         "${rule_name}" "${count}" << 'PYEOF'
+import sys, re, csv as csvmod
+
+tmp_out, csv_path, base, rule_name, count_str = \
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+count = int(count_str)
+base  = base.rstrip("/")
+
+def offset_to_line(filepath, offset):
+    try:
+        with open(filepath, 'rb') as f:
+            return f.read(offset).count(b'\n') + 1
+    except Exception:
+        return ""
+
+with open(tmp_out, 'r', errors='replace') as fh:
+    lines = fh.readlines()
+
+# YARA -s output format:
+#   RuleName /absolute/path/to/file        ← header
+#   0x1a:$string_var: matched content      ← one per matched string
+#   RuleName /another/file
+#   ...
+
+with open(csv_path, 'a', newline='', encoding='utf-8') as fh:
+    wr = csvmod.writer(fh, quoting=csvmod.QUOTE_ALL)
+    i = 0
+    while i < len(lines):
+        hdr = re.match(r'^(\S+)\s+(/\S+)', lines[i].rstrip('\n'))
+        if not hdr:
+            i += 1
+            continue
+
+        match_rule = hdr.group(1)
+        match_file = hdr.group(2)
+        rel_file   = match_file.replace(base + "/", "", 1)
+
+        # Collect all string-match lines that follow this header
+        j = i + 1
+        matches = []
+        while j < len(lines):
+            sm = re.match(r'^(0x[0-9a-fA-F]+):\$(\S+?):\s*(.*)', lines[j].rstrip('\n'))
+            if not sm:
+                break
+            matches.append((int(sm.group(1), 16), sm.group(2)))
+            j += 1
+
+        # ONE row per (rule, file) — use lowest offset to get the first line number
+        if matches:
+            first_offset = min(m[0] for m in matches)
+            lineno = offset_to_line(match_file, first_offset)
+            str_names = ", ".join(f"${m[1]}" for m in matches[:5])
+            extra = f" (+{len(matches)-5} more)" if len(matches) > 5 else ""
+            desc = (f"File matched YARA rule '{match_rule}' — "
+                    f"strings: {str_names}{extra}  [ruleset: {rule_name}]")
+        else:
+            lineno = ""
+            desc = f"File matched YARA rule '{match_rule}'  [ruleset: {rule_name}]"
+
+        wr.writerow([
+            "YARA", rel_file, str(lineno), "HIGH",
+            match_rule, "malware-pattern",
+            f"YARA Rule Match: {match_rule}",
+            desc, "", "Investigate file; quarantine if malicious"
+        ])
+        count += 1
+        i = j
+
+print(count, end="")
+PYEOF
+        )
+        rm -f "${tmp_out}"
+    done < <(find "${rules_dir}" -name "*.yar" -print0 2>/dev/null)
+
+    log_ok "YARA scan complete — ${count} match(es)"
+    PASSED_MODULES+=(yara)
+}
+
+# ── Dispatch module ───────────────────────────────────────────────────────────
+
+run_module() {
+    local mod="$1"
+    case "${mod}" in
+        semgrep)           run_semgrep ;;
+        bandit)            run_bandit ;;
+        pattern)           run_pattern ;;
+        secrets)           run_secrets ;;
+        gitleaks)          run_gitleaks ;;
+        trivy)             run_trivy ;;
+        dependency_check)  run_dependency_check ;;
+        checkov)           run_checkov ;;
+        codeql)            run_codeql ;;
+        yara)              run_yara ;;
+        *)                 log_warn "Unknown module: ${mod}" ;;
+    esac
+}
+
+# ── HTML Report Generation ────────────────────────────────────────────────────
+
+generate_html_report() {
+    log_sec "Generating Final HTML Report"
+
+    local report_script="${LIB_DIR}/generate_report.py"
+
+    if [[ ! -f "${report_script}" ]]; then
+        log_warn "Report generator not found at ${report_script}"
+        log_info "Install the tool properly to generate HTML reports"
+        return
+    fi
+
+    log_info "Combining results and building HTML report..."
+
+    local ai_args=()
+    if [[ "${USE_AI}" == "true" && -f "${REPORT_DIR}/ai_findings.csv" ]]; then
+        ai_args+=(--use-ai --ai-csv "${REPORT_DIR}/ai_findings.csv")
+    fi
+
+    if python3 "${report_script}" \
+        --report-dir "${REPORT_DIR}" \
+        --scan-name "${SCAN_NAME}" \
+        --scan-dir "${SCAN_DIR}" \
+        "${ai_args[@]}" \
+        2>>"${ERROR_LOG}"; then
+        log_ok "HTML report generated: ${REPORT_DIR}/report.html"
+    else
+        log_warn "HTML report generation failed — check ${ERROR_LOG}"
+    fi
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print_summary() {
+    local end_ts; end_ts=$(date +%s)
+    local duration=$((end_ts - START_TS))
+    local mins=$((duration / 60))
+    local secs=$((duration % 60))
+
+    # Count total findings across all CSVs (subtract header)
+    local total_findings=0
+    while IFS= read -r -d '' f; do
+        local cnt; cnt=$(wc -l < "${f}")
+        total_findings=$((total_findings + cnt - 1))
+    done < <(find "${REPORT_DIR}" -name "*.csv" -print0 2>/dev/null)
+
+    echo ""
+    echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║                        SCAN SUMMARY                                  ║${NC}"
+    echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    printf "${BOLD}${CYAN}║${NC}  %-35s %-32s ${BOLD}${CYAN}║${NC}\n" "Scan Name:"  "${SCAN_NAME}"
+    printf "${BOLD}${CYAN}║${NC}  %-35s %-32s ${BOLD}${CYAN}║${NC}\n" "Workspace:"  "${SCAN_DIR}"
+    printf "${BOLD}${CYAN}║${NC}  %-35s %-32s ${BOLD}${CYAN}║${NC}\n" "Duration:"   "${mins}m ${secs}s"
+    printf "${BOLD}${CYAN}║${NC}  %-35s %-32s ${BOLD}${CYAN}║${NC}\n" "Total Findings:" "${total_findings}"
+    echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+
+    if [[ ${#PASSED_MODULES[@]} -gt 0 ]]; then
+        printf "${BOLD}${CYAN}║${NC}  ${GREEN}%-35s${NC} %-32s ${BOLD}${CYAN}║${NC}\n" \
+            "Passed Modules (${#PASSED_MODULES[@]}):" "$(IFS=', '; echo "${PASSED_MODULES[*]}")"
+    fi
+    if [[ ${#SKIPPED_MODULES[@]} -gt 0 ]]; then
+        printf "${BOLD}${CYAN}║${NC}  ${YELLOW}%-35s${NC} %-32s ${BOLD}${CYAN}║${NC}\n" \
+            "Skipped Modules (${#SKIPPED_MODULES[@]}):" "$(IFS=', '; echo "${SKIPPED_MODULES[*]}")"
+    fi
+    if [[ ${#FAILED_MODULES[@]} -gt 0 ]]; then
+        printf "${BOLD}${CYAN}║${NC}  ${RED}%-35s${NC} %-32s ${BOLD}${CYAN}║${NC}\n" \
+            "Failed Modules (${#FAILED_MODULES[@]}):" "$(IFS=', '; echo "${FAILED_MODULES[*]}")"
+    fi
+
+    echo -e "${BOLD}${CYAN}╠══════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${BOLD}${CYAN}║${NC}  Reports:  ${REPORT_DIR}/"
+    echo -e "${BOLD}${CYAN}║${NC}  HTML:     ${REPORT_DIR}/report.html"
+    echo -e "${BOLD}${CYAN}║${NC}  Debug:    ${ERROR_LOG}"
+    echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    START_TS=$(date +%s)
+
+    parse_args "$@"
+    log_banner
+
+    # --ConfigureAI is a standalone interactive setup — no scan needed
+    if [[ "${CONFIGURE_AI}" == "true" ]]; then
+        configure_ai
+        exit 0
+    fi
+
+    validate_inputs
+    resolve_modules
+
+    log_info "Scan Name    : ${SCAN_NAME}"
+    log_info "ZIP File     : ${ZIP_FILE}"
+    log_info "Modules      : $(IFS=', '; echo "${SELECTED_MODULES[*]}")"
+    log_info "Verbose      : ${VERBOSE}"
+    [[ "${USE_AI}" == "true" ]] && log_info "AI Analysis  : enabled"
+
+    log_sec "Setting Up Scan Environment"
+    setup_dirs
+    extract_zip
+
+    log_sec "Running Security Modules"
+    local total="${#SELECTED_MODULES[@]}"
+    local idx=0
+    for mod in "${SELECTED_MODULES[@]}"; do
+        ((idx++))
+        echo ""
+        echo -e "${BOLD}[${idx}/${total}] Module: ${mod^^}${NC}"
+        echo -e "${DIM}────────────────────────────────────────────${NC}"
+        run_module "${mod}" || {
+            log_warn "Module '${mod}' encountered an error"
+            echo "[${mod^^}] Unexpected error in module runner" >> "${ERROR_LOG}"
+        }
+    done
+
+    if [[ "${USE_AI}" == "true" ]]; then
+        run_ai_scan || log_warn "AI scan did not complete successfully"
+    fi
+
+    generate_html_report
+    print_summary
+}
+
+main "$@"

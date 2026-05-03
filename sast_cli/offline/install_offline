@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Appu Corporation SAST Scanner — Offline Installer
+#  Version : 1.0.0
+#  Run on  : air-gapped / internet-restricted target machine  (as root)
+#  Usage   : sudo ./install_offline [options]
+#
+#  This script is included inside the bundle created by create_offline_bundle.
+#  It installs everything from the local payload/ directory — no internet needed.
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PAYLOAD_DIR="${SCRIPT_DIR}/payload"
+
+TOOLS_DIR="/opt/tools/SASTScanner"
+BIN_DIR="${TOOLS_DIR}/bin"
+RULES_DIR="${TOOLS_DIR}/rules"
+VENV_DIR="${TOOLS_DIR}/venv"
+TRIVY_CACHE_DIR="${TOOLS_DIR}/trivy-cache"
+CLI_DIR="${TOOLS_DIR}/cli"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'; DIM='\033[2m'
+
+ts()        { date '+%H:%M:%S'; }
+log_info()  { echo -e "${BLUE}[INFO]${NC}    $(ts) │ $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}      $(ts) │ $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}    $(ts) │ $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC}   $(ts) │ $*" >&2; }
+log_step()  { echo -e "\n${BOLD}${CYAN}── $* ${NC}"; }
+log_skip()  { echo -e "${DIM}[SKIP]${NC}    $(ts) │ $*"; }
+
+# ── Banner ───────────────────────────────────────────────────────────────────
+
+banner() {
+    echo ""
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║       Appu Corporation SAST Scanner  ─  Offline Installer          ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Version ${VERSION}   ─   No internet required                       ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# ── Usage / Version ──────────────────────────────────────────────────────────
+
+show_usage() {
+    echo ""
+    echo -e "${BOLD}Appu Corporation SAST Scanner${NC}"
+    echo ""
+    echo    "  Usage:  sudo ./install_offline [options]"
+    echo ""
+    echo -e "${BOLD}  Options${NC}"
+    printf  "    %-32s %s\n"  "--target-dir <path>"   "- Override install path. Default: /opt/tools/SASTScanner."
+    printf  "    %-32s %s\n"  "--version"             "- Provides version details."
+    printf  "    %-32s %s\n"  "--help/-h"             "- Provides help menu details."
+    echo ""
+}
+
+show_version() {
+    echo "sastscan-install-offline ${VERSION}"
+}
+
+# ── Argument Parsing ─────────────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target-dir)
+                TOOLS_DIR="$2"
+                BIN_DIR="${TOOLS_DIR}/bin"
+                RULES_DIR="${TOOLS_DIR}/rules"
+                VENV_DIR="${TOOLS_DIR}/venv"
+                TRIVY_CACHE_DIR="${TOOLS_DIR}/trivy-cache"
+                CLI_DIR="${TOOLS_DIR}/cli"
+                shift ;;
+            --target-dir=*)
+                TOOLS_DIR="${1#*=}"
+                BIN_DIR="${TOOLS_DIR}/bin"
+                RULES_DIR="${TOOLS_DIR}/rules"
+                VENV_DIR="${TOOLS_DIR}/venv"
+                TRIVY_CACHE_DIR="${TOOLS_DIR}/trivy-cache"
+                CLI_DIR="${TOOLS_DIR}/cli" ;;
+            --version)  show_version; exit 0 ;;
+            -h|--help)  show_usage;   exit 0 ;;
+            *) log_warn "Unknown option: $1" ;;
+        esac
+        shift
+    done
+}
+
+# ── Guards ────────────────────────────────────────────────────────────────────
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This installer must be run as root:  sudo ./install_offline"
+        exit 1
+    fi
+}
+
+check_payload() {
+    if [[ ! -d "${PAYLOAD_DIR}" ]]; then
+        log_error "payload/ directory not found at ${PAYLOAD_DIR}"
+        log_error "Make sure you extracted the full bundle archive before running this script."
+        exit 1
+    fi
+    log_ok "Bundle payload directory: ${PAYLOAD_DIR}"
+}
+
+# ── System Requirements ───────────────────────────────────────────────────────
+
+check_system_requirements() {
+    log_step "Checking system requirements"
+    local errs=0
+
+    # python3
+    if ! command -v python3 &>/dev/null; then
+        log_error "python3 not found."
+        log_error "  Debian/Ubuntu : sudo apt-get install python3"
+        log_error "  RHEL/CentOS   : sudo yum install python3"
+        ((errs++))
+    else
+        log_ok "python3  : $(python3 --version 2>&1)"
+    fi
+
+    # python3-venv
+    if ! python3 -m venv --help &>/dev/null 2>&1; then
+        log_error "python3-venv module not found."
+        log_error "  Debian/Ubuntu : sudo apt-get install python3-venv"
+        log_error "  RHEL/CentOS   : sudo yum install python3"
+        ((errs++))
+    else
+        log_ok "python3-venv : available"
+    fi
+
+    # unzip — needed by sastscan at scan time
+    if ! command -v unzip &>/dev/null; then
+        log_warn "unzip not found — required for scanning ZIP archives."
+        log_warn "  Install: sudo apt-get install unzip"
+    else
+        log_ok "unzip    : $(unzip -v 2>&1 | head -1)"
+    fi
+
+    # java — only required if dependency-check is in the bundle
+    if [[ -d "${PAYLOAD_DIR}/dependency-check" ]]; then
+        if ! command -v java &>/dev/null; then
+            log_warn "Java not found — OWASP Dependency Check requires Java 17+."
+            log_warn "  Install: sudo apt-get install openjdk-17-jre-headless"
+            log_warn "  dependency_check module will be skipped until Java is installed."
+        else
+            log_ok "java     : $(java -version 2>&1 | head -1)"
+        fi
+    fi
+
+    [[ ${errs} -gt 0 ]] && { log_error "Fix the errors above and re-run."; exit 1; }
+    log_ok "System requirements satisfied"
+}
+
+# ── Directory Structure ───────────────────────────────────────────────────────
+
+setup_dirs() {
+    log_step "Creating directory structure"
+    mkdir -p \
+        "${TOOLS_DIR}" \
+        "${BIN_DIR}" \
+        "${RULES_DIR}/semgrep" \
+        "${RULES_DIR}/yara" \
+        "${TOOLS_DIR}/lib" \
+        "${VENV_DIR}" \
+        "${TRIVY_CACHE_DIR}" \
+        "${CLI_DIR}"
+    log_ok "Install root: ${TOOLS_DIR}"
+}
+
+# ── Python Tools from Local Wheels ────────────────────────────────────────────
+
+install_python_tools() {
+    log_step "Creating Python virtual environment"
+    python3 -m venv "${VENV_DIR}"
+    log_ok "Virtualenv created: ${VENV_DIR}"
+
+    local wheels_dir="${PAYLOAD_DIR}/wheels"
+    if [[ ! -d "${wheels_dir}" ]] || [[ -z "$(ls "${wheels_dir}" 2>/dev/null)" ]]; then
+        log_error "No wheel files found in ${wheels_dir}"
+        log_error "The bundle may be incomplete — re-run create_offline_bundle."
+        exit 1
+    fi
+    local wcount; wcount=$(ls "${wheels_dir}" | wc -l)
+    log_info "Installing from ${wcount} local wheel files (no internet)..."
+
+    # Upgrade pip/wheel/setuptools from local cache first
+    "${VENV_DIR}/bin/pip" install --quiet --no-index \
+        --find-links="${wheels_dir}" pip wheel setuptools 2>/dev/null || true
+
+    # Install the three tools (all transitive deps are in wheels_dir)
+    local failed=()
+    for pkg in semgrep bandit checkov; do
+        log_info "Installing ${pkg}..."
+        if "${VENV_DIR}/bin/pip" install --quiet --no-index \
+                --find-links="${wheels_dir}" "${pkg}" 2>/dev/null; then
+            local ver; ver=$("${VENV_DIR}/bin/${pkg}" --version 2>/dev/null | head -1)
+            log_ok "${pkg} installed: ${ver}"
+        else
+            log_warn "Failed to install ${pkg} — module will be skipped during scans"
+            failed+=("${pkg}")
+        fi
+    done
+
+    # Symlink each tool binary into BIN_DIR
+    for t in semgrep bandit checkov; do
+        [[ -f "${VENV_DIR}/bin/${t}" ]] && \
+            ln -sf "${VENV_DIR}/bin/${t}" "${BIN_DIR}/${t}" 2>/dev/null || true
+    done
+    log_ok "Python tool symlinks created in ${BIN_DIR}"
+}
+
+# ── Binary Tools ─────────────────────────────────────────────────────────────
+
+install_binaries() {
+    log_step "Installing binary tools (gitleaks, trivy, yara)"
+    for bin in gitleaks trivy yara; do
+        local src="${PAYLOAD_DIR}/bin/${bin}"
+        if [[ -f "${src}" && -x "${src}" ]] || [[ -f "${src}" ]]; then
+            install -m 755 "${src}" "${BIN_DIR}/${bin}"
+            log_ok "${bin} installed → ${BIN_DIR}/${bin}"
+        else
+            log_skip "${bin} not in bundle — ${bin} module will be skipped during scans"
+        fi
+    done
+}
+
+# ── Trivy Vulnerability Database ─────────────────────────────────────────────
+
+install_trivy_db() {
+    local src="${PAYLOAD_DIR}/trivy-cache"
+    if [[ -d "${src}" ]] && [[ -n "$(ls "${src}" 2>/dev/null)" ]]; then
+        log_step "Restoring Trivy vulnerability database"
+        cp -r "${src}/." "${TRIVY_CACHE_DIR}/"
+        local db_size; db_size=$(du -sh "${TRIVY_CACHE_DIR}" 2>/dev/null | cut -f1)
+        log_ok "Trivy DB restored to ${TRIVY_CACHE_DIR}  (${db_size})"
+    else
+        log_skip "Trivy vulnerability database not in bundle — first trivy scan will require internet"
+    fi
+}
+
+# ── OWASP Dependency Check ────────────────────────────────────────────────────
+
+install_dependency_check() {
+    local src="${PAYLOAD_DIR}/dependency-check"
+    if [[ ! -d "${src}" ]]; then
+        log_skip "OWASP Dependency Check not in bundle — dependency_check module will be skipped"
+        return
+    fi
+    log_step "Installing OWASP Dependency Check"
+    local dc_dest="${TOOLS_DIR}/dependency-check"
+    rm -rf "${dc_dest}"
+    cp -r "${src}" "${dc_dest}"
+    chmod +x "${dc_dest}/bin/dependency-check.sh"
+    chmod -R a+rw "${dc_dest}/data/" 2>/dev/null || true
+    local db_size; db_size=$(du -sh "${dc_dest}/data" 2>/dev/null | cut -f1)
+    log_ok "OWASP Dependency Check installed (NVD DB: ${db_size})"
+}
+
+# ── CodeQL ────────────────────────────────────────────────────────────────────
+
+install_codeql() {
+    local src="${PAYLOAD_DIR}/codeql"
+    if [[ ! -d "${src}" ]]; then
+        log_skip "CodeQL not in bundle — codeql module will be skipped"
+        return
+    fi
+    log_step "Installing CodeQL"
+    local codeql_dest="${TOOLS_DIR}/codeql"
+    rm -rf "${codeql_dest}"
+    cp -r "${src}" "${codeql_dest}"
+    chmod +x "${codeql_dest}/codeql"
+    local ver; ver=$("${codeql_dest}/codeql" version --format=terse 2>/dev/null | head -1)
+    log_ok "CodeQL installed: ${ver}  → ${codeql_dest}"
+}
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+install_rules() {
+    log_step "Installing rule sets"
+
+    local semgrep_src="${PAYLOAD_DIR}/rules/semgrep"
+    if [[ -d "${semgrep_src}" ]] && [[ -n "$(ls "${semgrep_src}" 2>/dev/null)" ]]; then
+        cp -r "${semgrep_src}/." "${RULES_DIR}/semgrep/"
+        local count; count=$(find "${RULES_DIR}/semgrep" \
+            -name "*.yaml" -o -name "*.yml" 2>/dev/null | wc -l)
+        log_ok "Semgrep rules: ${count} rule files installed"
+    else
+        log_skip "Semgrep rules not in bundle — semgrep will use 'auto' config (requires internet)"
+    fi
+
+    local yara_src="${PAYLOAD_DIR}/rules/yara"
+    if [[ -d "${yara_src}" ]] && [[ -n "$(ls "${yara_src}" 2>/dev/null)" ]]; then
+        cp -r "${yara_src}/." "${RULES_DIR}/yara/"
+        local count; count=$(find "${RULES_DIR}/yara" -name "*.yar" 2>/dev/null | wc -l)
+        log_ok "YARA rules: ${count} .yar files installed"
+    else
+        log_skip "YARA rules not in bundle — yara module will be skipped during scans"
+    fi
+}
+
+# ── Library Files ─────────────────────────────────────────────────────────────
+
+install_lib_files() {
+    log_step "Installing library files"
+    if [[ -d "${SCRIPT_DIR}/lib" ]] && [[ -n "$(ls "${SCRIPT_DIR}/lib" 2>/dev/null)" ]]; then
+        cp -r "${SCRIPT_DIR}/lib/." "${TOOLS_DIR}/lib/"
+        log_ok "Library files installed to ${TOOLS_DIR}/lib/"
+    else
+        log_warn "lib/ not found in bundle — HTML report generation will not work"
+    fi
+}
+
+# ── CLI Scripts ───────────────────────────────────────────────────────────────
+
+install_cli_scripts() {
+    log_step "Installing sastscan CLI scripts"
+    for f in sastscan uninstall install_offline; do
+        if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
+            cp "${SCRIPT_DIR}/${f}" "${CLI_DIR}/${f}"
+            chmod +x "${CLI_DIR}/${f}"
+            log_ok "Installed: ${CLI_DIR}/${f}"
+        fi
+    done
+}
+
+# ── System-wide Symlinks ──────────────────────────────────────────────────────
+
+create_symlinks() {
+    log_step "Creating system-wide symlinks in /usr/local/bin"
+
+    if [[ -f "${CLI_DIR}/sastscan" ]]; then
+        ln -sf "${CLI_DIR}/sastscan" /usr/local/bin/sastscan
+        log_ok "Symlink: /usr/local/bin/sastscan → ${CLI_DIR}/sastscan"
+    fi
+
+    for t in semgrep bandit checkov gitleaks trivy yara; do
+        local bin_path="${BIN_DIR}/${t}"
+        if [[ -x "${bin_path}" ]]; then
+            ln -sf "${bin_path}" "/usr/local/bin/${t}" 2>/dev/null || true
+            log_ok "Symlink: /usr/local/bin/${t}"
+        fi
+    done
+}
+
+# ── PATH and Environment Profile ─────────────────────────────────────────────
+
+create_path_profile() {
+    log_step "Creating environment profile"
+    cat > /etc/profile.d/sastscan.sh << PROFILE
+# Appu Corporation SAST Scanner — environment settings
+export PATH="\$PATH:${BIN_DIR}"
+export TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR}"
+PROFILE
+    chmod 644 /etc/profile.d/sastscan.sh
+    log_ok "Profile created: /etc/profile.d/sastscan.sh"
+    log_info "Run 'source /etc/profile.d/sastscan.sh' or open a new shell to activate"
+}
+
+# ── Verify Installation ───────────────────────────────────────────────────────
+
+verify_installation() {
+    log_step "Verifying installation"
+    echo ""
+    printf "  %-28s %-12s %s\n"  "Component"         "Status"   "Details"
+    printf "  %-28s %-12s %s\n"  "─────────────────────────" "──────────" "──────────────"
+
+    for t in semgrep bandit checkov; do
+        if [[ -x "${VENV_DIR}/bin/${t}" ]]; then
+            local ver; ver=$("${VENV_DIR}/bin/${t}" --version 2>/dev/null | head -1)
+            printf "  ${GREEN}%-28s${NC} %-12s %s\n" "${t}" "OK" "${ver}"
+        else
+            printf "  ${YELLOW}%-28s${NC} %-12s\n"   "${t}" "NOT INSTALLED"
+        fi
+    done
+
+    for b in gitleaks trivy yara; do
+        if [[ -x "${BIN_DIR}/${b}" ]]; then
+            printf "  ${GREEN}%-28s${NC} %-12s\n" "${b}" "OK"
+        else
+            printf "  ${YELLOW}%-28s${NC} %-12s\n" "${b}" "NOT IN BUNDLE"
+        fi
+    done
+
+    if [[ -x "${TOOLS_DIR}/dependency-check/bin/dependency-check.sh" ]]; then
+        printf "  ${GREEN}%-28s${NC} %-12s\n" "dependency-check" "OK"
+    else
+        printf "  ${DIM}%-28s${NC} %-12s\n"  "dependency-check" "SKIPPED"
+    fi
+
+    if [[ -x "${TOOLS_DIR}/codeql/codeql" ]]; then
+        printf "  ${GREEN}%-28s${NC} %-12s\n" "codeql" "OK"
+    else
+        printf "  ${DIM}%-28s${NC} %-12s\n"  "codeql" "SKIPPED"
+    fi
+
+    local trivy_db_size; trivy_db_size=$(du -sh "${TRIVY_CACHE_DIR}" 2>/dev/null | cut -f1 || echo "0")
+    printf "  %-28s %-12s %s\n" "trivy vulnerability DB" "" "${trivy_db_size}"
+
+    local sr; sr=$(find "${RULES_DIR}/semgrep" -name "*.yaml" -o -name "*.yml" 2>/dev/null | wc -l)
+    local yr; yr=$(find "${RULES_DIR}/yara"    -name "*.yar"                  2>/dev/null | wc -l)
+    printf "  %-28s %-12s %s\n" "semgrep rules" "" "${sr} files"
+    printf "  %-28s %-12s %s\n" "yara rules"    "" "${yr} files"
+
+    echo ""
+    printf "  %-28s %s\n" "Install path:"  "${TOOLS_DIR}"
+    printf "  %-28s %s\n" "CLI location:"  "${CLI_DIR}/sastscan"
+    echo ""
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print_summary() {
+    echo -e "${BOLD}${GREEN}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${GREEN}║          Offline installation complete                             ║${NC}"
+    echo -e "${BOLD}${GREEN}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo    "  Activate PATH  :  source /etc/profile.d/sastscan.sh"
+    echo    "  Run a scan     :  sastscan --zip <file.zip> --name <ScanName>"
+    echo    "  Help           :  sastscan --help"
+    echo    "  Uninstall      :  sudo ${CLI_DIR}/uninstall"
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+    banner
+    require_root
+    check_payload
+    check_system_requirements
+    setup_dirs
+    install_python_tools
+    install_binaries
+    install_trivy_db
+    install_dependency_check
+    install_codeql
+    install_rules
+    install_lib_files
+    install_cli_scripts
+    create_symlinks
+    create_path_profile
+    verify_installation
+    print_summary
+}
+
+main "$@"

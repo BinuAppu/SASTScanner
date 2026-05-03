@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  Appu Corporation SAST Scanner — Offline Bundle Creator
+#  Version : 1.0.0
+#  Run on  : internet-connected machine (same OS / arch as target)
+#  Output  : sastscan_offline_YYYYMMDD.tar.gz  (transfer this to target)
+# =============================================================================
+
+set -uo pipefail
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUNDLE_DATE=$(date '+%Y%m%d')
+BUNDLE_NAME="sastscan_offline_${BUNDLE_DATE}"
+WORK_DIR=$(mktemp -d)
+BUNDLE_DIR="${WORK_DIR}/${BUNDLE_NAME}"
+OUTPUT_FILE="${SCRIPT_DIR}/${BUNDLE_NAME}.tar.gz"
+
+# ── Flags ────────────────────────────────────────────────────────────────────
+SKIP_CODEQL=false
+SKIP_DEPCHECK=false
+SKIP_RULES=false
+NVD_API_KEY=""
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'; DIM='\033[2m'
+
+ts()        { date '+%H:%M:%S'; }
+log_info()  { echo -e "${BLUE}[INFO]${NC}    $(ts) │ $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${NC}      $(ts) │ $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC}    $(ts) │ $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC}   $(ts) │ $*" >&2; }
+log_step()  { echo -e "\n${BOLD}${CYAN}── $* ${NC}"; }
+log_skip()  { echo -e "${DIM}[SKIP]${NC}    $(ts) │ $*"; }
+
+cleanup() { rm -rf "${WORK_DIR}"; }
+trap cleanup EXIT
+
+# ── Banner ───────────────────────────────────────────────────────────────────
+
+banner() {
+    echo ""
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║       Appu Corporation SAST Scanner  ─  Offline Bundle Creator     ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Version ${VERSION}   ─   Run on internet-connected machine           ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# ── Usage / Version ──────────────────────────────────────────────────────────
+
+show_usage() {
+    echo ""
+    echo -e "${BOLD}Appu Corporation SAST Scanner${NC}"
+    echo ""
+    echo    "  Usage:  ./create_offline_bundle [options]"
+    echo ""
+    echo -e "${BOLD}  Options${NC}"
+    printf  "    %-32s %s\n"  "--skip-codeql"         "- Skip CodeQL download (~500 MB)."
+    printf  "    %-32s %s\n"  "--skip-depcheck"       "- Skip OWASP Dependency Check download."
+    printf  "    %-32s %s\n"  "--skip-rules"          "- Skip Semgrep / YARA rule set download."
+    printf  "    %-32s %s\n"  "--nvd-api-key <key>"   "- NVD API key for faster database population."
+    printf  "    %-32s %s\n"  "--version"             "- Provides version details."
+    printf  "    %-32s %s\n"  "--help/-h"             "- Provides help menu details."
+    echo ""
+    echo    "  NOTE: Run this script on a machine with the SAME OS and CPU architecture"
+    echo    "        as the target machine. Python wheels and binaries are platform-specific."
+    echo ""
+}
+
+show_version() {
+    echo "sastscan-create-offline-bundle ${VERSION}"
+}
+
+# ── Argument Parsing ─────────────────────────────────────────────────────────
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --skip-codeql)    SKIP_CODEQL=true ;;
+            --skip-depcheck)  SKIP_DEPCHECK=true ;;
+            --skip-rules)     SKIP_RULES=true ;;
+            --nvd-api-key)    NVD_API_KEY="$2"; shift ;;
+            --nvd-api-key=*)  NVD_API_KEY="${1#*=}" ;;
+            --version)        show_version; exit 0 ;;
+            -h|--help)        show_usage;   exit 0 ;;
+            *) log_warn "Unknown option: $1" ;;
+        esac
+        shift
+    done
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+arch_name() {
+    local a; a=$(uname -m)
+    case "${a}" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)             echo "${a}" ;;
+    esac
+}
+
+get_latest_gh_release() {
+    # $1 = owner/repo  → prints latest tag
+    curl -fsSL "https://api.github.com/repos/$1/releases/latest" \
+        2>/dev/null | grep '"tag_name"' | head -1 | \
+        sed 's/.*"tag_name":\s*"\([^"]*\)".*/\1/'
+}
+
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+
+check_prereqs() {
+    log_step "Checking prerequisites on bundler machine"
+    local missing=()
+    for cmd in python3 pip3 curl git unzip tar; do
+        command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Required tools missing on this machine: ${missing[*]}"
+        log_error "Install them and re-run: sudo apt-get install ${missing[*]}"
+        exit 1
+    fi
+    log_ok "python3 : $(python3 --version 2>&1)"
+    log_ok "pip3    : $(pip3 --version 2>&1 | head -1)"
+    log_ok "curl    : $(curl --version 2>&1 | head -1)"
+    log_ok "git     : $(git --version)"
+    log_ok "All prerequisites present"
+}
+
+# ── Bundle directory ──────────────────────────────────────────────────────────
+
+init_bundle_dir() {
+    log_step "Initializing bundle directory"
+    mkdir -p \
+        "${BUNDLE_DIR}/payload/wheels" \
+        "${BUNDLE_DIR}/payload/bin" \
+        "${BUNDLE_DIR}/payload/trivy-cache" \
+        "${BUNDLE_DIR}/payload/rules/semgrep" \
+        "${BUNDLE_DIR}/payload/rules/yara" \
+        "${BUNDLE_DIR}/lib"
+    log_ok "Bundle workspace: ${BUNDLE_DIR}"
+}
+
+# ── CLI Scripts ───────────────────────────────────────────────────────────────
+
+copy_cli_scripts() {
+    log_step "Copying sastscan CLI scripts into bundle"
+    for f in sastscan uninstall install_offline; do
+        if [[ -f "${SCRIPT_DIR}/${f}" ]]; then
+            cp "${SCRIPT_DIR}/${f}" "${BUNDLE_DIR}/${f}"
+            chmod +x "${BUNDLE_DIR}/${f}"
+            log_ok "Bundled: ${f}"
+        else
+            log_warn "${f} not found at ${SCRIPT_DIR}/${f} — skipping"
+        fi
+    done
+    if [[ -d "${SCRIPT_DIR}/lib" ]]; then
+        cp -r "${SCRIPT_DIR}/lib/." "${BUNDLE_DIR}/lib/"
+        log_ok "Bundled: lib/"
+    else
+        log_warn "lib/ not found — HTML report generation will be unavailable"
+    fi
+}
+
+# ── Python Wheels ─────────────────────────────────────────────────────────────
+
+download_python_wheels() {
+    log_step "Downloading Python packages (semgrep, bandit, checkov + all dependencies)"
+    local wheels_dir="${BUNDLE_DIR}/payload/wheels"
+
+    # Bootstrap packages first
+    pip3 download --quiet pip wheel setuptools -d "${wheels_dir}" 2>/dev/null || true
+
+    for pkg in semgrep bandit checkov; do
+        log_info "Downloading ${pkg} and all its dependencies..."
+        if pip3 download --quiet "${pkg}" -d "${wheels_dir}"; then
+            log_ok "${pkg} — done"
+        else
+            log_warn "Failed to download ${pkg} wheels — module will not be available offline"
+        fi
+    done
+
+    local count; count=$(ls "${wheels_dir}" | wc -l)
+    log_ok "Total wheel files in bundle: ${count}"
+}
+
+# ── Gitleaks ──────────────────────────────────────────────────────────────────
+
+download_gitleaks() {
+    log_step "Downloading Gitleaks"
+    local arch; arch=$(arch_name)
+    local tag;  tag=$(get_latest_gh_release "gitleaks/gitleaks")
+    [[ -z "${tag}" ]] && tag="v8.18.4"
+    local ver="${tag#v}"
+    local url="https://github.com/gitleaks/gitleaks/releases/download/${tag}/gitleaks_${ver}_linux_${arch}.tar.gz"
+    local tmp; tmp=$(mktemp -d)
+
+    log_info "Downloading Gitleaks ${tag} (linux/${arch})..."
+    if curl -fsSL "${url}" | tar -xz -C "${tmp}" 2>/dev/null; then
+        install -m 755 "${tmp}/gitleaks" "${BUNDLE_DIR}/payload/bin/gitleaks"
+        log_ok "Gitleaks ${tag} bundled"
+    else
+        log_warn "Failed to download Gitleaks — gitleaks module will be skipped on target"
+    fi
+    rm -rf "${tmp}"
+}
+
+# ── Trivy ─────────────────────────────────────────────────────────────────────
+
+download_trivy() {
+    log_step "Downloading Trivy binary + vulnerability database"
+    local arch; arch=$(arch_name)
+    local tag;  tag=$(get_latest_gh_release "aquasecurity/trivy")
+    [[ -z "${tag}" ]] && tag="v0.52.2"
+    local ver="${tag#v}"
+    local url="https://github.com/aquasecurity/trivy/releases/download/${tag}/trivy_${ver}_Linux-64bit.tar.gz"
+    [[ "${arch}" == "arm64" ]] && \
+        url="https://github.com/aquasecurity/trivy/releases/download/${tag}/trivy_${ver}_Linux-ARM64.tar.gz"
+    local tmp; tmp=$(mktemp -d)
+
+    log_info "Downloading Trivy ${tag} (linux/${arch})..."
+    if curl -fsSL "${url}" | tar -xz -C "${tmp}" 2>/dev/null; then
+        install -m 755 "${tmp}/trivy" "${BUNDLE_DIR}/payload/bin/trivy"
+        log_ok "Trivy ${tag} binary bundled"
+
+        log_info "Downloading Trivy vulnerability database (~200 MB)..."
+        local trivy_cache="${BUNDLE_DIR}/payload/trivy-cache"
+        if "${BUNDLE_DIR}/payload/bin/trivy" \
+                --cache-dir "${trivy_cache}" \
+                image --download-db-only --quiet 2>/dev/null; then
+            local db_size; db_size=$(du -sh "${trivy_cache}" 2>/dev/null | cut -f1)
+            log_ok "Trivy vulnerability database bundled (${db_size})"
+        else
+            log_warn "Trivy DB download failed — target will need internet to pull DB on first scan"
+        fi
+    else
+        log_warn "Failed to download Trivy — trivy module will be skipped on target"
+    fi
+    rm -rf "${tmp}"
+}
+
+# ── OWASP Dependency Check ────────────────────────────────────────────────────
+
+download_dependency_check() {
+    if ${SKIP_DEPCHECK}; then
+        log_skip "OWASP Dependency Check skipped (--skip-depcheck)"
+        return
+    fi
+    log_step "Downloading OWASP Dependency Check + NVD database"
+    local tag; tag=$(get_latest_gh_release "jeremylong/DependencyCheck")
+    [[ -z "${tag}" ]] && tag="v9.2.0"
+    local ver="${tag#v}"
+    local url="https://github.com/jeremylong/DependencyCheck/releases/download/${tag}/dependency-check-${ver}-release.zip"
+    local tmp; tmp=$(mktemp -d)
+    local dc_dest="${BUNDLE_DIR}/payload/dependency-check"
+
+    log_info "Downloading OWASP Dependency Check ${tag}..."
+    if curl -fsSL -o "${tmp}/dc.zip" "${url}" 2>/dev/null && \
+       unzip -q "${tmp}/dc.zip" -d "${tmp}" 2>/dev/null; then
+        mv "${tmp}/dependency-check" "${dc_dest}"
+        chmod +x "${dc_dest}/bin/dependency-check.sh"
+        log_ok "OWASP Dependency Check ${tag} bundled"
+
+        log_info "Populating NVD database (may take 30-60 min without API key)..."
+        if [[ -n "${NVD_API_KEY}" ]]; then
+            log_info "Using NVD API key — faster download (~2-3 min)"
+            "${dc_dest}/bin/dependency-check.sh" \
+                --updateonly \
+                --nvdApiKey "${NVD_API_KEY}" \
+                --data "${dc_dest}/data" 2>/dev/null || true
+        else
+            log_warn "No --nvd-api-key provided — rate-limited download (may take 30-60 min)"
+            log_warn "Pass --nvd-api-key <KEY> to speed this up significantly"
+            "${dc_dest}/bin/dependency-check.sh" \
+                --updateonly \
+                --data "${dc_dest}/data" 2>/dev/null || true
+        fi
+        chmod -R a+rw "${dc_dest}/data/" 2>/dev/null || true
+        local db_size; db_size=$(du -sh "${dc_dest}/data" 2>/dev/null | cut -f1)
+        log_ok "NVD database bundled (${db_size})"
+    else
+        log_warn "Failed to download OWASP Dependency Check — dependency_check module will be skipped"
+    fi
+    rm -rf "${tmp}"
+}
+
+# ── CodeQL ────────────────────────────────────────────────────────────────────
+
+download_codeql() {
+    if ${SKIP_CODEQL}; then
+        log_skip "CodeQL skipped (--skip-codeql)"
+        return
+    fi
+    log_step "Downloading CodeQL bundle (~500 MB)"
+    local bundle_ver
+    bundle_ver=$(curl -fsSL \
+        "https://api.github.com/repos/github/codeql-action/releases/latest" \
+        2>/dev/null | grep '"tag_name"' | grep "codeql-bundle" | head -1 \
+        | sed 's/.*"tag_name":\s*"\([^"]*\)".*/\1/')
+    [[ -z "${bundle_ver}" ]] && bundle_ver="codeql-bundle-v2.17.6"
+
+    local url="https://github.com/github/codeql-action/releases/download/${bundle_ver}/codeql-bundle-linux64.tar.gz"
+    local tmp; tmp=$(mktemp -d)
+
+    log_info "Downloading CodeQL ${bundle_ver}..."
+    if curl -fsSL --progress-bar -o "${tmp}/codeql.tar.gz" "${url}" 2>/dev/null; then
+        tar -xzf "${tmp}/codeql.tar.gz" -C "${BUNDLE_DIR}/payload/" 2>/dev/null
+        log_ok "CodeQL ${bundle_ver} bundled"
+    else
+        log_warn "Failed to download CodeQL — codeql module will be skipped on target"
+    fi
+    rm -rf "${tmp}"
+}
+
+# ── YARA ─────────────────────────────────────────────────────────────────────
+
+bundle_yara() {
+    log_step "Bundling YARA binary"
+
+    # Prefer an already-installed binary on this machine
+    if command -v yara &>/dev/null; then
+        local yara_bin; yara_bin=$(command -v yara)
+        install -m 755 "${yara_bin}" "${BUNDLE_DIR}/payload/bin/yara"
+        log_ok "YARA binary copied from ${yara_bin}: $(yara --version 2>/dev/null)"
+        return
+    fi
+
+    # Fall back to building from source
+    if ! command -v cmake &>/dev/null || ! command -v automake &>/dev/null; then
+        log_warn "YARA not installed and build tools (cmake/automake) absent — skipping YARA"
+        log_warn "Install YARA on this machine first: sudo apt-get install yara"
+        return
+    fi
+
+    log_info "Building YARA from source (cmake/automake present)..."
+    local tag; tag=$(get_latest_gh_release "VirusTotal/yara")
+    [[ -z "${tag}" ]] && tag="v4.5.2"
+    local ver="${tag#v}"
+    local tmp; tmp=$(mktemp -d)
+
+    if curl -fsSL \
+        "https://github.com/VirusTotal/yara/archive/refs/tags/${tag}.tar.gz" \
+        | tar -xz -C "${tmp}" 2>/dev/null; then
+        (
+            cd "${tmp}/yara-${ver}"
+            ./bootstrap.sh  2>/dev/null
+            ./configure     2>/dev/null
+            make -j"$(nproc)" 2>/dev/null
+            install -m 755 yara "${BUNDLE_DIR}/payload/bin/yara"
+        ) && log_ok "YARA ${tag} built and bundled" \
+          || log_warn "YARA build failed — yara module will be skipped on target"
+    else
+        log_warn "Failed to fetch YARA source — skipping"
+    fi
+    rm -rf "${tmp}"
+}
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+download_rules() {
+    if ${SKIP_RULES}; then
+        log_skip "Rule sets skipped (--skip-rules)  — semgrep will use 'auto' (needs internet on target)"
+        return
+    fi
+
+    log_step "Downloading Semgrep rules"
+    local semgrep_dest="${BUNDLE_DIR}/payload/rules/semgrep"
+    log_info "Cloning semgrep-rules (shallow)..."
+    if git clone --depth=1 --quiet \
+        "https://github.com/semgrep/semgrep-rules.git" \
+        "${semgrep_dest}" 2>/dev/null; then
+        rm -rf "${semgrep_dest}/.git" "${semgrep_dest}/.github"
+        local count; count=$(find "${semgrep_dest}" -name "*.yaml" -o -name "*.yml" | wc -l)
+        log_ok "Semgrep rules: ${count} files"
+    else
+        log_warn "Failed to clone Semgrep rules — semgrep will fall back to 'auto' config on target"
+    fi
+
+    log_step "Downloading YARA rules"
+    local yara_dest="${BUNDLE_DIR}/payload/rules/yara"
+    log_info "Cloning Yara-Rules (shallow)..."
+    git clone --depth=1 --quiet \
+        "https://github.com/Yara-Rules/rules.git" \
+        "${yara_dest}/yara-rules" 2>/dev/null || true
+    log_info "Cloning signature-base (shallow)..."
+    git clone --depth=1 --quiet \
+        "https://github.com/Neo23x0/signature-base.git" \
+        "${yara_dest}/signature-base" 2>/dev/null || true
+
+    # Flatten .yar files to the rules root for easy scanning
+    find "${yara_dest}" -name "*.yar" -o -name "*.yara" 2>/dev/null | head -200 | \
+    while read -r f; do
+        local bn; bn=$(basename "${f}")
+        [[ ! -f "${yara_dest}/${bn}" ]] && \
+            cp "${f}" "${yara_dest}/${bn}" 2>/dev/null || true
+    done
+
+    local ycount; ycount=$(find "${yara_dest}" -maxdepth 1 -name "*.yar" | wc -l)
+    log_ok "YARA rules: ${ycount} .yar files at rules root"
+}
+
+# ── Package ───────────────────────────────────────────────────────────────────
+
+create_tarball() {
+    log_step "Packaging bundle archive"
+    log_info "Output: ${OUTPUT_FILE}"
+    log_info "Compressing — this may take a moment for large bundles..."
+    tar -czf "${OUTPUT_FILE}" -C "${WORK_DIR}" "${BUNDLE_NAME}"
+    local size; size=$(du -sh "${OUTPUT_FILE}" | cut -f1)
+    log_ok "Bundle archive created: ${OUTPUT_FILE}  (${size})"
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print_summary() {
+    local size; size=$(du -sh "${OUTPUT_FILE}" 2>/dev/null | cut -f1)
+    local bn; bn=$(basename "${OUTPUT_FILE}")
+    echo ""
+    echo -e "${BOLD}${CYAN}╔════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${CYAN}║                    Bundle Creation Complete                        ║${NC}"
+    echo -e "${BOLD}${CYAN}╚════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    printf  "  %-16s %s  (%s)\n" "Bundle:" "${OUTPUT_FILE}" "${size}"
+    echo ""
+    echo -e "  ${BOLD}Step 1 — Transfer to target machine:${NC}"
+    echo    "    scp ${OUTPUT_FILE} user@target:/tmp/"
+    echo ""
+    echo -e "  ${BOLD}Step 2 — On the target machine:${NC}"
+    echo    "    tar -xzf /tmp/${bn} -C /tmp"
+    echo    "    sudo /tmp/${BUNDLE_NAME}/install_offline"
+    echo ""
+    echo -e "  ${BOLD}Step 3 — Activate and scan:${NC}"
+    echo    "    source /etc/profile.d/sastscan.sh"
+    echo    "    sastscan --zip <file.zip> --name <ScanName>"
+    echo ""
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    parse_args "$@"
+    banner
+    check_prereqs
+    init_bundle_dir
+    copy_cli_scripts
+    download_python_wheels
+    download_gitleaks
+    download_trivy
+    download_dependency_check
+    download_codeql
+    bundle_yara
+    download_rules
+    create_tarball
+    print_summary
+}
+
+main "$@"
